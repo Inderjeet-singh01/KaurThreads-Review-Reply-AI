@@ -50,7 +50,7 @@ class ReviewNotFoundError(GoogleReviewError):
 # ---------------------------------------------------------------------------
 # Location handling (single boutique location, Phase 1)
 # ---------------------------------------------------------------------------
-def get_location_name() -> str:
+def get_location_name(client: GoogleBusinessClient | None = None) -> str:
     """Resolve the boutique's location name via the Business Profile APIs.
 
     The app targets one boutique location. When ``GOOGLE_LOCATION_ID`` is
@@ -60,7 +60,7 @@ def get_location_name() -> str:
     Returns a resource name of the form
     ``accounts/{account_id}/locations/{location_id}``.
     """
-    client = get_google_client()
+    client = client or get_google_client()
 
     try:
         accounts_response = client.list_accounts()
@@ -133,7 +133,7 @@ def get_location_name() -> str:
 def get_reviews(client: GoogleBusinessClient | None = None) -> list[dict[str, Any]]:
     """Fetch all reviews of the boutique location (follows pagination)."""
     client = client or get_google_client()
-    location_name = get_location_name()
+    location_name = get_location_name(client)
     reviews: list[dict[str, Any]] = []
     page_token: str | None = None
     while True:
@@ -175,7 +175,7 @@ def get_review(
     resource name). Raises ReviewNotFoundError when Google returns 404.
     """
     client = client or get_google_client()
-    location_name = get_location_name()
+    location_name = get_location_name(client)
     review_name = f"{location_name}/reviews/{review_id}"
     try:
         return client.get_review(review_name)
@@ -203,7 +203,7 @@ def publish_reply(
         raise GoogleReviewError(
             f"Reply is too long for Google (max {MAX_REPLY_BYTES} bytes)."
         )
-    location_name = get_location_name()
+    location_name = get_location_name(client)
     review_name = f"{location_name}/reviews/{review_id}"
     try:
         response = client.update_review_reply(review_name, comment)

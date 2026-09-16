@@ -162,10 +162,22 @@ class GoogleBusinessClient:
         elif status == 404:
             base = "Google could not find the requested resource."
         elif status == 429:
-            base = (
-                "Google API quota/rate limit exceeded. Your project may need "
-                "a quota increase, or retry later."
-            )
+            # Distinguish quota-0 (API access not approved) from transient
+            # rate-limiting.  Google's error message for a zero-quota project
+            # typically contains "Quota exceeded for quota metric" with
+            # "per minute" language on a consumer/project basis.
+            if detail and "Quota exceeded" in detail:
+                base = (
+                    "Google Business Profile API access is not approved for "
+                    "this project yet. Your project's quota is 0. Please "
+                    "request GBP API access from Google (see "
+                    "https://developers.google.com/my-business/content/prereqs) "
+                    "before using the application."
+                )
+            else:
+                base = (
+                    "Google API rate limit exceeded. Please wait and retry."
+                )
         else:
             base = f"Google API request failed with HTTP {status}"
         if detail:

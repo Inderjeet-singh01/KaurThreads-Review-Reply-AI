@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -36,9 +37,17 @@ SCOPES = [GOOGLE_SCOPE_BUSINESS_MANAGE]
 
 router = APIRouter(prefix="/auth/google", tags=["Google OAuth"])
 
-# Single-user local tool: remember the OAuth ``state`` of the in-progress
-# flow so the callback can be validated against it.
+# Single-user local tool: remember the in-progress OAuth flow so the callback
+# uses the SAME Flow instance that created the authorization URL. This is
+# required: the flow generates a PKCE code_verifier at URL-creation time and
+# must send it back during the code exchange — a fresh Flow (without the
+# verifier) makes Google reject the code with 400.
 _current_state: str | None = None
+_current_flow: Flow | None = None
+
+# Google OAuth client IDs always look like:
+# 123456789012-abc123def456.apps.googleusercontent.com
+_CLIENT_ID_RE = re.compile(r"^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$")
 
 
 class GoogleOAuthError(Exception):
@@ -96,10 +105,13 @@ def get_authorization_url() -> tuple[str, str]:
     authorization_url, state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
-        include_granted_scopes=True,
+        # Google requires the literal strings "true"/"false" here — a Python
+        # bool would be stringified to "True" and rejected with 400.
+        include_granted_scopes="true",
     )
-    global _current_state
+    global _current_state, _current_flow
     _current_state = state
+    _current_flow = flow
     logger.info("Google authorization URL created")
     return authorization_url, state
 
@@ -107,27 +119,43 @@ def get_authorization_url() -> tuple[str, str]:
 def complete_authorization(code: str, state: str) -> Credentials:
     """Exchange the authorization code for credentials and save them.
 
+    Must reuse the Flow instance that created the authorization URL (it
+    holds the PKCE code_verifier Google expects in the code exchange).
+
     Raises GoogleOAuthError when the state does not match or Google rejects
     the code. On success the token file is written.
     """
-    flow = _build_flow()
+    global _current_flow
     if _current_state is not None and state != _current_state:
         logger.warning("OAuth callback state did not match the started flow")
         raise GoogleOAuthError(
             "OAuth state mismatch. Open the authorization URL again and "
             "complete the flow."
         )
+    if _current_flow is None:
+        # Server restarted mid-flow: the PKCE verifier is gone, so Google
+        # will reject the code. Ask the user to start a fresh flow.
+        logger.warning(
+            "OAuth callback received but no in-progress flow (server "
+            "restarted?); building a fresh flow — code exchange will likely "
+            "fail until a new authorization URL is used"
+        )
+        _current_flow = _build_flow()
     try:
-        flow.fetch_token(code=code)
+        _current_flow.fetch_token(code=code)
     except Exception as exc:  # network error or invalid_code from Google
         logger.error("Failed to exchange OAuth code for credentials: %s", exc)
+        hint = (
+            " If the server restarted since the URL was requested, get a new "
+            "authorization URL and complete the flow again."
+        )
         raise GoogleOAuthError(
-            "Google rejected the authorization code. Please retry the "
-            "authorization flow."
+            f"Google rejected the authorization code ({exc}). Please retry "
+            f"the authorization flow.{hint}"
         ) from exc
-    save_credentials(flow.credentials)
+    save_credentials(_current_flow.credentials)
     logger.info("Google OAuth completed; token saved to %s", GOOGLE_TOKEN_FILE)
-    return flow.credentials
+    return _current_flow.credentials
 
 
 def save_credentials(credentials: Credentials) -> None:
@@ -250,19 +278,32 @@ def authorize() -> dict[str, str]:
     ``business.manage`` scope. Google then redirects the browser back to
     ``GOOGLE_REDIRECT_URI`` (this app's callback), which completes
     authentication.
+
+    If ``GOOGLE_CLIENT_ID`` does not look like a real Google OAuth client
+    ID (e.g. it is still the placeholder from `.env.example`), a
+    ``warning`` field is included — Google rejects such URLs with a 400.
     """
     try:
         authorization_url, state = get_authorization_url()
     except GoogleOAuthError as exc:
         raise _oauth_http_error(exc) from exc
-    return {"authorization_url": authorization_url, "state": state}
+    result: dict[str, str] = {"authorization_url": authorization_url, "state": state}
+    if not _CLIENT_ID_RE.match(settings.google_client_id or ""):
+        result["warning"] = (
+            "GOOGLE_CLIENT_ID does not look like a valid Google OAuth client ID "
+            "(expected format: 123456789012-abc123def.apps.googleusercontent.com). "
+            "Put the real Client ID from Google Cloud Console (APIs & Services -> "
+            "Credentials -> your OAuth client) into .env, restart the server, and "
+            "request this URL again — Google rejects placeholder client IDs with a 400."
+        )
+    return result
 
 
 @router.get("/callback")
 def callback(
     code: str = Query(..., description="Authorization code returned by Google."),
     state: str = Query("", description="State value returned by Google."),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """OAuth callback: exchange the code for credentials and store them."""
     try:
         complete_authorization(code, state)

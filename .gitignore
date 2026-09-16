@@ -2,5 +2,5 @@
 credentials/
 .venv/
 venv/
-**pycache**/
+__pycache__/
 *.pyc

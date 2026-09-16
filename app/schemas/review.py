@@ -52,7 +52,6 @@ class PublishRequest(BaseModel):
 
     reply: str = Field(
         min_length=1,
-        max_length=MAX_REPLY_BYTES,
         description="Final reply text, written or edited by the user.",
     )
 

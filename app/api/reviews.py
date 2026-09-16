@@ -43,12 +43,19 @@ router = APIRouter(prefix="/reviews", tags=["Reviews"])
 def _to_http_error(exc: Exception) -> HTTPException:
     """Map domain exceptions to clean FastAPI HTTP errors."""
     if isinstance(exc, GoogleOAuthError):
-        return HTTPException(status_code=503, detail=str(exc))
+        return HTTPException(status_code=401, detail=str(exc))
     if isinstance(exc, LocationNotFoundError):
         return HTTPException(status_code=503, detail=str(exc))
     if isinstance(exc, ReviewNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
-    if isinstance(exc, (GoogleAPIError, GoogleReviewError)):
+    if isinstance(exc, GoogleAPIError):
+        # Surface Google's status when it distinguishes the failure mode.
+        if exc.status == 429:
+            return HTTPException(status_code=503, detail=str(exc))
+        if exc.status == 403:
+            return HTTPException(status_code=403, detail=str(exc))
+        return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, GoogleReviewError):
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, GroqError):
         return HTTPException(status_code=502, detail=str(exc))

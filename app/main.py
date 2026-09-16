@@ -12,12 +12,29 @@ from fastapi import FastAPI
 
 from app.api.reviews import router as reviews_router
 from app.auth.google_oauth import router as google_auth_router
+from app.config import settings
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Startup validation: fail fast when required env vars are missing
+# ---------------------------------------------------------------------------
+_REQUIRED_SETTINGS = {
+    "GOOGLE_CLIENT_ID": settings.google_client_id,
+    "GOOGLE_CLIENT_SECRET": settings.google_client_secret,
+    "GOOGLE_REDIRECT_URI": settings.google_redirect_uri,
+    "GROQ_API_KEY": settings.groq_api_key,
+}
+_missing = [name for name, value in _REQUIRED_SETTINGS.items() if not value]
+if _missing:
+    raise RuntimeError(
+        "Missing required environment variables: "
+        f"{', '.join(_missing)}. Set them in the .env file and restart."
+    )
 
 app = FastAPI(
     title="Google Review Reply AI",
