@@ -1,5 +1,10 @@
 # Google Review Reply AI — Phase 1
 
+**Live deployment**
+
+- Frontend: <https://review-reply-ai-frontend.onrender.com>
+- Backend: <https://review-reply-ai-ylkw.onrender.com>
+
 A FastAPI application for a **boutique business** that:
 
 1. Authenticates the owner with **Google OAuth 2.0** (Business Profile management scope).
