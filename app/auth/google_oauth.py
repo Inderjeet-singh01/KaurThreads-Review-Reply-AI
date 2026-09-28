@@ -318,6 +318,26 @@ def callback(
     }
 
 
+@router.post("/logout")
+def logout() -> dict[str, Any]:
+    """Disconnect the Google account by deleting the stored token file."""
+    global _current_state, _current_flow
+    _current_state = None
+    _current_flow = None
+    existed = GOOGLE_TOKEN_FILE.exists()
+    if existed:
+        try:
+            GOOGLE_TOKEN_FILE.unlink()
+        except OSError as exc:
+            logger.error("Failed to delete token file: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="Could not disconnect the Google account. Try again.",
+            ) from exc
+    logger.info("Google account disconnected (token file removed=%s)", existed)
+    return {"authenticated": False, "message": "Google account disconnected."}
+
+
 def _oauth_http_error(exc: GoogleOAuthError) -> HTTPException:
     if isinstance(exc, GoogleOAuthNotConfiguredError):
         return HTTPException(status_code=503, detail=str(exc))

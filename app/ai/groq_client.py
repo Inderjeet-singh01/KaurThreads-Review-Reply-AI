@@ -60,12 +60,35 @@ Return only the reply text, ready to publish.
 """
 
 
-def generate_review_reply(review: dict[str, Any]) -> str:
+# Human-readable guidance appended to the prompt for the optional UI controls.
+_TONE_GUIDANCE = {
+    "friendly & professional": "Tone: friendly and professional.",
+    "warm & personal": "Tone: warm, personal and heartfelt.",
+    "professional": "Tone: polished and strictly professional.",
+    "apologetic": (
+        "Tone: sincerely apologetic and understanding (do not admit legal "
+        "fault or promise compensation)."
+    ),
+}
+_LENGTH_GUIDANCE = {
+    "short": "Length: very concise, 1 to 2 short sentences.",
+    "medium": "Length: 2 to 3 short sentences.",
+    "long": "Length: 4 to 5 short sentences, still concise.",
+}
+
+
+def generate_review_reply(
+    review: dict[str, Any],
+    tone: str | None = None,
+    length: str | None = None,
+) -> str:
     """Generate a professional reply for a normalized review.
 
     ``review`` is the normalized review shape produced by
     :func:`app.google.reviews.normalize_review` (``rating``, ``reviewer``,
-    ``review`` — the text may be empty for rating-only reviews).
+    ``review`` — the text may be empty for rating-only reviews). ``tone`` and
+    ``length`` are optional UI hints that nudge the wording; unknown values
+    are ignored so the endpoint stays permissive.
 
     Returns the generated reply text. This function never publishes anything.
     """
@@ -85,11 +108,26 @@ def generate_review_reply(review: dict[str, Any]) -> str:
     )
     rating_line = f"{rating} out of 5" if rating is not None else "not rated"
 
+    preferences = [
+        guidance
+        for value, table in (
+            (tone, _TONE_GUIDANCE),
+            (length, _LENGTH_GUIDANCE),
+        )
+        if value and (guidance := table.get(value.strip().lower()))
+    ]
+    preference_block = (
+        ("\nReply preferences:\n" + "\n".join(preferences) + "\n")
+        if preferences
+        else ""
+    )
+
     user_prompt = (
         "Customer review for our boutique:\n"
         f"Rating: {rating_line}\n"
         f"Reviewer: {reviewer}\n"
-        f"Review text: {review_text}\n\n"
+        f"Review text: {review_text}\n"
+        f"{preference_block}\n"
         "Write our public reply to this review now. Return only the reply text."
     )
 

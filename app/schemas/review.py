@@ -28,6 +28,38 @@ class Review(BaseModel):
         default=False,
         description="Whether the business has already replied on Google.",
     )
+    reply_comment: str | None = Field(
+        default=None,
+        description="The business reply text posted on Google, when present.",
+    )
+    reply_updated_at: str | None = Field(
+        default=None,
+        description="ISO-8601 timestamp of the business reply, when present.",
+    )
+    profile_photo_url: str | None = Field(
+        default=None, description="Reviewer profile photo URL, when available."
+    )
+
+
+class LocationSummary(BaseModel):
+    """A Business Profile location with per-location review counts."""
+
+    location_id: str
+    name: str
+    address: str = ""
+    total_reviews: int = 0
+    answered: int = 0
+    unanswered: int = 0
+    average_rating: float | None = None
+
+
+class ReviewStats(BaseModel):
+    """Aggregate review statistics for the dashboard cards."""
+
+    total_reviews: int = 0
+    answered: int = 0
+    unanswered: int = 0
+    average_rating: float | None = None
 
 
 class GenerateReplyResponse(BaseModel):

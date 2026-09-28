@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from google.oauth2.credentials import Credentials
@@ -160,7 +161,15 @@ class GoogleBusinessClient:
                 "account can manage this Business Profile."
             )
         elif status == 404:
-            base = "Google could not find the requested resource."
+            # Include the request path (never the token — that lives in the
+            # Authorization header, not the URL) so a wrong resource path is
+            # debuggable. This is a path problem, NOT "no reviews".
+            path = urlsplit(response.url).path if response.url else ""
+            base = (
+                "Google could not find the requested resource (HTTP 404). "
+                "This is an invalid resource path, not an empty result. "
+                f"Requested path: {path}"
+            )
         elif status == 429:
             # Distinguish quota-0 (API access not approved) from transient
             # rate-limiting.  Google's error message for a zero-quota project
@@ -203,10 +212,11 @@ class GoogleBusinessClient:
         """List the locations of a My Business account (business info v1).
 
         ``account_name`` has the form ``accounts/{account_id}``. ``readMask``
-        is a required query parameter of this endpoint; only ``name`` and
-        ``title`` are needed here.
+        is a required query parameter of this endpoint; ``name``, ``title``
+        and ``storefrontAddress`` are requested so the frontend can show a
+        readable business name and address per location.
         """
-        params: dict[str, Any] = {"readMask": "name,title"}
+        params: dict[str, Any] = {"readMask": "name,title,storefrontAddress"}
         if page_token:
             params["pageToken"] = page_token
         return self._request(

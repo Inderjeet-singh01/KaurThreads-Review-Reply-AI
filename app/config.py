@@ -46,6 +46,24 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
 
+    # --- Frontend / CORS --------------------------------------------------
+    # Comma-separated list of browser origins allowed to call this API.
+    # Defaults cover the local Vite dev server. Set CORS_ALLOW_ORIGINS in
+    # .env for other hosts (e.g. a deployed frontend URL).
+    cors_allow_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:4173,http://127.0.0.1:4173"
+    )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """Parsed list of allowed CORS origins."""
+        return [
+            origin.strip()
+            for origin in self.cors_allow_origins.split(",")
+            if origin.strip()
+        ]
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",

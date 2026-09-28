@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #f6f8fb;
+  color: #0f1a2e;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Subtle scrollbar for scroll areas */
+.scroll-area {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.scroll-area::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-area::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 9999px;
+}
+.scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg text-sm font-semibold
+      transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500
+      focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+  .btn-primary {
+    @apply btn bg-brand-600 px-4 py-2.5 text-white hover:bg-brand-700;
+  }
+  .btn-secondary {
+    @apply btn border border-slate-300 bg-white px-4 py-2.5 text-slate-700 hover:bg-slate-50;
+  }
+  .btn-ghost {
+    @apply btn px-3 py-2 text-slate-600 hover:bg-slate-100;
+  }
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white shadow-card;
+  }
+  .input {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-sm
+      text-slate-800 placeholder:text-slate-400 focus:border-brand-500 focus:outline-none
+      focus:ring-2 focus:ring-brand-100;
+  }
+  .select {
+    @apply w-full appearance-none rounded-lg border border-slate-300 bg-white px-3 py-2.5
+      text-sm text-slate-800 focus:border-brand-500 focus:outline-none focus:ring-2
+      focus:ring-brand-100;
+  }
+}

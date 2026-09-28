@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.ai.groq_client import GroqError, generate_review_reply
 from app.auth.google_oauth import GoogleOAuthError
@@ -22,7 +22,9 @@ from app.google.reviews import (
     GoogleReviewError,
     LocationNotFoundError,
     ReviewNotFoundError,
+    compute_stats,
     get_review,
+    get_reviews,
     get_unanswered_reviews,
     has_reply,
     normalize_review,
@@ -33,6 +35,15 @@ from app.schemas.review import (
     PublishRequest,
     PublishResult,
     Review,
+    ReviewStats,
+)
+
+_LOCATION_QUERY = Query(
+    None,
+    description=(
+        "Business Profile location id to operate on. Defaults to the "
+        "configured / first location when omitted."
+    ),
 )
 
 logger = logging.getLogger(__name__)
@@ -63,21 +74,50 @@ def _to_http_error(exc: Exception) -> HTTPException:
 
 
 @router.get("", response_model=list[Review])
-def list_unanswered_reviews() -> list[Review]:
+def list_unanswered_reviews(location_id: str | None = _LOCATION_QUERY) -> list[Review]:
     """Return only reviews that do NOT yet have a business reply.
 
     Reviews that already carry a business reply on Google are skipped;
     Google is the source of truth for reply state.
     """
     try:
-        unanswered = get_unanswered_reviews()
+        unanswered = get_unanswered_reviews(location_id=location_id)
     except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
         raise _to_http_error(exc) from exc
     return [Review(**normalize_review(review)) for review in unanswered]
 
 
+@router.get("/all", response_model=list[Review])
+def list_all_reviews(location_id: str | None = _LOCATION_QUERY) -> list[Review]:
+    """Return every review for the location (answered and unanswered).
+
+    Includes the posted business reply text for answered reviews, so the
+    frontend can render the "All Reviews" and "Replied Reviews" views.
+    """
+    try:
+        reviews = get_reviews(location_id=location_id)
+    except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
+        raise _to_http_error(exc) from exc
+    return [Review(**normalize_review(review)) for review in reviews]
+
+
+@router.get("/stats", response_model=ReviewStats)
+def review_stats(location_id: str | None = _LOCATION_QUERY) -> ReviewStats:
+    """Aggregate counts and average rating for the dashboard cards."""
+    try:
+        reviews = get_reviews(location_id=location_id)
+    except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
+        raise _to_http_error(exc) from exc
+    return ReviewStats(**compute_stats(reviews))
+
+
 @router.post("/{review_id}/generate", response_model=GenerateReplyResponse)
-def generate_reply(review_id: str) -> GenerateReplyResponse:
+def generate_reply(
+    review_id: str,
+    location_id: str | None = _LOCATION_QUERY,
+    tone: str | None = Query(None, description="Optional tone hint for the reply."),
+    length: str | None = Query(None, description="Optional length hint for the reply."),
+) -> GenerateReplyResponse:
     """Generate an AI reply draft for a review.
 
     Fetches the current review from Google, refuses to run when the review
@@ -85,7 +125,7 @@ def generate_reply(review_id: str) -> GenerateReplyResponse:
     Nothing is published by this endpoint.
     """
     try:
-        raw_review = get_review(review_id)
+        raw_review = get_review(review_id, location_id=location_id)
     except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
         raise _to_http_error(exc) from exc
 
@@ -105,7 +145,7 @@ def generate_reply(review_id: str) -> GenerateReplyResponse:
     review = normalize_review(raw_review)
     logger.info("Reply generation requested for review %s", review_id)
     try:
-        reply = generate_review_reply(review)
+        reply = generate_review_reply(review, tone=tone, length=length)
     except GroqError as exc:
         raise _to_http_error(exc) from exc
     logger.info("Reply generated for review %s (not published)", review_id)
@@ -117,7 +157,11 @@ def generate_reply(review_id: str) -> GenerateReplyResponse:
 
 
 @router.post("/{review_id}/publish", response_model=PublishResult)
-def publish_review_reply(review_id: str, payload: PublishRequest) -> PublishResult:
+def publish_review_reply(
+    review_id: str,
+    payload: PublishRequest,
+    location_id: str | None = _LOCATION_QUERY,
+) -> PublishResult:
     """Publish the user-approved final reply to Google.
 
     The review is re-fetched from Google immediately before publishing. If a
@@ -130,7 +174,7 @@ def publish_review_reply(review_id: str, payload: PublishRequest) -> PublishResu
     )
 
     try:
-        raw_review = get_review(review_id)
+        raw_review = get_review(review_id, location_id=location_id)
     except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
         raise _to_http_error(exc) from exc
 
@@ -148,7 +192,7 @@ def publish_review_reply(review_id: str, payload: PublishRequest) -> PublishResu
         )
 
     try:
-        publish_reply(review_id, final_text)
+        publish_reply(review_id, final_text, location_id=location_id)
     except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
         raise _to_http_error(exc) from exc
 
