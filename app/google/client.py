@@ -1,7 +1,7 @@
 """Authenticated Google API client for the Business Profile APIs.
 
 This module answers one question: "How do I create an authenticated Google
-client?" It loads the OAuth token from ``credentials/google_token.json``,
+client?" It loads the OAuth token from ``GOOGLE_TOKEN_FILE``,
 keeps it fresh (refresh on expiry / 401), and exposes the Business Profile
 REST endpoints this application needs.
 

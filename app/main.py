@@ -54,11 +54,14 @@ if not settings.gemini_api_key:
 
 logger.info(
     "Automatic replies: enabled=%s dry_run=%s max_regenerations=%d "
-    "locations=%s webhook_auth_configured=%s token_file=%s",
+    "locations=%s webhook_auth_configured=%s token_file=%s "
+    "token_file_source=%s token_file_exists=%s",
     settings.auto_reply_enabled, settings.auto_reply_dry_run,
     settings.auto_reply_max_regenerations,
     settings.auto_reply_location_list or "all", pubsub_auth_configured(),
     GOOGLE_TOKEN_FILE,
+    "GOOGLE_TOKEN_FILE" if settings.google_token_file.strip() else "default",
+    GOOGLE_TOKEN_FILE.is_file(),
 )
 if settings.auto_reply_enabled and not pubsub_auth_configured():
     logger.warning(

@@ -2,7 +2,8 @@
 
 All secrets are read from environment variables (optionally via a local
 `.env` file). Nothing sensitive is hardcoded, and the Google OAuth token is
-never stored in `.env` — it lives in `credentials/google_token.json`.
+never stored in `.env` — it lives in GOOGLE_TOKEN_FILE (default
+`credentials/google_token.json`).
 """
 
 from __future__ import annotations
@@ -17,9 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Where the Google OAuth token is persisted by default. This directory is
 # gitignored. GOOGLE_TOKEN_FILE (see Settings) can point elsewhere, e.g. a
-# persistent disk in production — see the bottom of this module.
+# persistent disk in production — resolved at the bottom of this module.
 CREDENTIALS_DIR = PROJECT_ROOT / "credentials"
-GOOGLE_TOKEN_FILE = CREDENTIALS_DIR / "google_token.json"
 
 # Google Business Profile management scope required by this application.
 # A single token with this scope works across the three Business Profile
@@ -115,7 +115,22 @@ class Settings(BaseSettings):
     )
 
 
+def resolve_google_token_file(configured: str) -> Path:
+    """The OAuth token path: GOOGLE_TOKEN_FILE when set, else the default.
+
+    Surrounding whitespace/quotes (easy to paste into a dashboard) are
+    ignored, and a relative path is anchored at the project root rather than
+    the process working directory.
+    """
+    value = configured.strip().strip("'\"").strip()
+    if not value:
+        return CREDENTIALS_DIR / "google_token.json"
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 settings = Settings()
 
-if settings.google_token_file:
-    GOOGLE_TOKEN_FILE = Path(settings.google_token_file).expanduser()
+# The single canonical token path. Every reader/writer (OAuth callback,
+# status, load_credentials -> Google client -> automation) uses this value.
+GOOGLE_TOKEN_FILE = resolve_google_token_file(settings.google_token_file)

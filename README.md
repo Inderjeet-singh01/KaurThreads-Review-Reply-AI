@@ -623,6 +623,18 @@ empty. The JWT is never logged.
     The file contains the refresh token **and the OAuth client secret** —
     keep it out of Git. Don't use Connect/Disconnect on Render with this
     option; re-run OAuth locally and re-upload to rotate.
+- **Verify the token path** after every deploy. The startup log line
+  `Automatic replies: ...` ends with `token_file=... token_file_source=...
+  token_file_exists=...`, and `GET /auth/google/status` reports (no token
+  values) `configured_token_path`, `token_path_source` (`GOOGLE_TOKEN_FILE`
+  or `default`), `env_variable_set`, `file_exists`, `file_readable`,
+  `credential_type` and `refresh_token_present`.
+  `GET /auth/google/status?verify=true` also makes one read-only Business
+  Profile call (`google_api_ok`). `token_path_source: "default"` on Render
+  means the running process does not see `GOOGLE_TOKEN_FILE` — check the
+  key name on *this* service and redeploy. `credential_type:
+  "oauth_client_config"` means the client secret JSON from Cloud Console
+  was uploaded instead of the OAuth token file.
 - **Refresh tokens must not expire:** while the OAuth consent screen's
   publishing status is **Testing**, Google expires refresh tokens after
   7 days. Set it to **In production** for unattended use.

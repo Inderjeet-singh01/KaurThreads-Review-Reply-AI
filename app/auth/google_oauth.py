@@ -5,13 +5,15 @@ This module ONLY handles OAuth authentication/authorization:
 * creating the Google authorization URL,
 * the required OAuth scopes,
 * the OAuth callback (authorization code -> credentials),
-* loading / saving / refreshing the token in ``credentials/google_token.json``.
+* loading / saving / refreshing the token in ``GOOGLE_TOKEN_FILE`` (default
+  ``credentials/google_token.json``; see :mod:`app.config`).
 
 It never fetches reviews and never publishes replies.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -153,7 +155,19 @@ def complete_authorization(code: str, state: str) -> Credentials:
             f"Google rejected the authorization code ({exc}). Please retry "
             f"the authorization flow.{hint}"
         ) from exc
-    save_credentials(_current_flow.credentials)
+    try:
+        save_credentials(_current_flow.credentials)
+    except OSError as exc:
+        logger.error(
+            "Could not write the Google token file at %s (%s)",
+            GOOGLE_TOKEN_FILE, type(exc).__name__,
+        )
+        raise GoogleOAuthError(
+            f"Google OAuth succeeded but the token could not be saved to "
+            f"{GOOGLE_TOKEN_FILE} ({type(exc).__name__}). If GOOGLE_TOKEN_FILE "
+            "points at a read-only Render Secret File, upload the token there "
+            "instead of running the OAuth flow in production."
+        ) from exc
     logger.info("Google OAuth completed; token saved to %s", GOOGLE_TOKEN_FILE)
     return _current_flow.credentials
 
@@ -217,7 +231,7 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
 
 
 def load_credentials() -> Credentials:
-    """Load usable Google credentials from ``credentials/google_token.json``.
+    """Load usable Google credentials from ``GOOGLE_TOKEN_FILE``.
 
     Raises GoogleOAuthError when the OAuth flow has not been completed or the
     stored credentials can no longer be used.
@@ -243,37 +257,114 @@ def load_credentials() -> Credentials:
         logger.error("Google token refresh failed: %s", exc)
         raise GoogleOAuthError(
             "The stored Google credentials have expired and could not be "
-            "refreshed automatically. Delete credentials/google_token.json "
-            "and complete the OAuth flow again."
+            f"refreshed automatically. Replace {GOOGLE_TOKEN_FILE} by "
+            "completing the OAuth flow again."
         ) from exc
     if not credentials.token:
         raise GoogleOAuthError(
-            "The stored Google credentials are not usable. Delete "
-            "credentials/google_token.json and complete the OAuth flow again "
+            f"The stored Google credentials in {GOOGLE_TOKEN_FILE} are not "
+            "usable. Replace the file by completing the OAuth flow again "
             "via GET /auth/google/authorize."
         )
     return credentials
 
 
-def get_auth_status() -> dict[str, Any]:
-    """Report whether the app currently holds usable Google credentials."""
-    if not GOOGLE_TOKEN_FILE.exists():
+def _credential_type(data: Any) -> str:
+    """Classify a token file by its keys only (values are never inspected)."""
+    if not isinstance(data, dict):
+        return "unknown"
+    if "web" in data or "installed" in data:
+        # The OAuth client secret downloaded from Google Cloud Console — not
+        # a user token; it cannot authenticate API calls.
+        return "oauth_client_config"
+    if data.get("type") == "service_account":
+        return "service_account"
+    if data.get("refresh_token") or data.get("type") == "authorized_user":
+        return "authorized_user"
+    return "unknown"
+
+
+def token_file_diagnostics() -> dict[str, Any]:
+    """Safe metadata about the configured token file — never its contents.
+
+    Reports where the token is expected, why (GOOGLE_TOKEN_FILE or default),
+    and whether the file exists, is readable, and looks like a user token.
+    """
+    path = GOOGLE_TOKEN_FILE
+    exists = path.is_file()
+    info: dict[str, Any] = {
+        "configured_token_path": str(path),
+        "token_path_source": (
+            "GOOGLE_TOKEN_FILE" if settings.google_token_file.strip() else "default"
+        ),
+        "env_variable_set": bool(os.environ.get("GOOGLE_TOKEN_FILE", "").strip()),
+        "file_exists": exists,
+        "file_readable": exists and os.access(path, os.R_OK),
+    }
+    if info["file_readable"]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            info["credential_type"] = "invalid_json"
+        else:
+            info["credential_type"] = _credential_type(data)
+            info["refresh_token_present"] = bool(
+                isinstance(data, dict) and data.get("refresh_token")
+            )
+    elif not exists:
+        # Helps spot a Secret File uploaded under a different name. Only file
+        # NAMES containing "token" are listed, never contents.
+        parent = path.parent
+        info["parent_dir_exists"] = parent.is_dir()
+        if info["parent_dir_exists"]:
+            try:
+                info["similar_files_in_dir"] = sorted(
+                    entry.name for entry in parent.iterdir()
+                    if "token" in entry.name.lower()
+                )[:10]
+            except OSError:
+                pass
+    return info
+
+
+def _verify_google_api() -> dict[str, Any]:
+    """One live, read-only Business Profile call with the stored token."""
+    # Imported lazily: app.google.client itself imports this module.
+    from app.google.client import GoogleAPIError, get_google_client
+
+    try:
+        accounts = get_google_client().list_accounts().get("accounts") or []
+    except (GoogleOAuthError, GoogleAPIError) as exc:
+        return {"google_api_ok": False, "google_api_error": str(exc)}
+    return {"google_api_ok": True, "google_accounts_visible": len(accounts)}
+
+
+def get_auth_status(verify: bool = False) -> dict[str, Any]:
+    """Report whether the app currently holds usable Google credentials.
+
+    Always includes :func:`token_file_diagnostics`. With ``verify`` a live
+    Google Business Profile call confirms the token actually works.
+    """
+    diagnostics = token_file_diagnostics()
+    if not diagnostics["file_exists"]:
         return {
             "authenticated": False,
-            "reason": (
-                "OAuth not completed (credentials/google_token.json does not "
-                "exist yet)."
-            ),
+            "reason": f"OAuth not completed (no token file at {GOOGLE_TOKEN_FILE}).",
+            **diagnostics,
         }
     try:
         credentials = load_credentials()
     except GoogleOAuthError as exc:
-        return {"authenticated": False, "reason": str(exc)}
-    return {
+        return {"authenticated": False, "reason": str(exc), **diagnostics}
+    result: dict[str, Any] = {
         "authenticated": True,
         "expires_at": credentials.expiry.isoformat() if credentials.expiry else None,
         "token_file": str(GOOGLE_TOKEN_FILE),
+        **diagnostics,
     }
+    if verify:
+        result.update(_verify_google_api())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +373,17 @@ def get_auth_status() -> dict[str, Any]:
 
 
 @router.get("/status")
-def auth_status() -> dict[str, Any]:
-    """Whether the app currently holds valid Google credentials."""
-    return get_auth_status()
+def auth_status(
+    verify: bool = Query(
+        False, description="Also make one read-only Google Business Profile call."
+    ),
+) -> dict[str, Any]:
+    """Whether the app currently holds valid Google credentials.
+
+    Includes safe token-file diagnostics (path, existence, readability,
+    credential type) — never token values.
+    """
+    return get_auth_status(verify=verify)
 
 
 @router.get("/authorize")
