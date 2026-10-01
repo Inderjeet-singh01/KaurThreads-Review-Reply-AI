@@ -30,7 +30,6 @@ const automation = (overrides: Partial<AutomationStatus> = {}): AutomationStatus
   location_ids: [],
   webhook_auth_configured: true,
   test_endpoint_enabled: false,
-  backfill_configured: true,
   backfill_delay_seconds: 2,
   ...overrides,
 })
@@ -114,9 +113,8 @@ function renderPanel(props: Partial<Parameters<typeof BulkReplyPanel>[0]> = {}) 
 
 const startButton = () => screen.findByRole('button', { name: /Reply to All Pending Reviews/ })
 
-async function confirmStart(key = 'secret-key') {
+async function confirmStart() {
   fireEvent.click(await startButton())
-  fireEvent.change(screen.getByLabelText('Admin key'), { target: { value: key } })
   fireEvent.click(screen.getByRole('button', { name: 'Start Bulk Reply' }))
 }
 
@@ -169,24 +167,21 @@ describe('BulkReplyPanel button and confirmation', () => {
     expect(button.disabled).toBe(true)
     cleanup()
 
-    mocked.getAutomationStatus.mockResolvedValue(automation({ backfill_configured: false }))
-    renderPanel()
-    expect(await screen.findByText(/AUTOMATION_BACKFILL_KEY is not set/)).toBeTruthy()
-    expect(((await startButton()) as HTMLButtonElement).disabled).toBe(true)
-    cleanup()
-
     mocked.getAutomationStatus.mockResolvedValue(automation({ enabled: false }))
     renderPanel()
     expect(await screen.findByText(/AUTO_REPLY_ENABLED=false/)).toBeTruthy()
     expect(((await startButton()) as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('requires the admin key', async () => {
+  it('starts with one confirmation click and no key', async () => {
+    mocked.startBackfill.mockResolvedValue({ started: true, job_id: 'job1', total_reviews: 30 })
+    mocked.getBackfill.mockResolvedValue(job())
     renderPanel()
-    fireEvent.click(await startButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Start Bulk Reply' }))
-    expect((await screen.findByRole('alert')).textContent).toMatch(/Enter the admin key/)
-    expect(mocked.startBackfill).not.toHaveBeenCalled()
+    await waitFor(async () => expect(((await startButton()) as HTMLButtonElement).disabled).toBe(false))
+    await confirmStart()
+    expect(screen.queryByLabelText(/key/i)).toBeNull()
+    expect(await screen.findByText('Bulk Reply in Progress')).toBeTruthy()
+    expect(mocked.startBackfill).toHaveBeenCalledWith(LOCATION)
   })
 })
 
@@ -201,7 +196,7 @@ describe('BulkReplyPanel progress and completion', () => {
     await waitFor(async () => expect(((await startButton()) as HTMLButtonElement).disabled).toBe(false))
     await confirmStart()
 
-    expect(mocked.startBackfill).toHaveBeenCalledWith(LOCATION, 'secret-key')
+    expect(mocked.startBackfill).toHaveBeenCalledWith(LOCATION)
     expect(await screen.findByText('Bulk Reply in Progress')).toBeTruthy()
     // The start button is gone while the job runs (cannot start twice).
     expect(screen.queryByRole('button', { name: /Reply to All Pending Reviews/ })).toBeNull()
@@ -213,7 +208,6 @@ describe('BulkReplyPanel progress and completion', () => {
     expect(screen.getByText('Processed: 30')).toBeTruthy()
     expect(screen.getByText('27')).toBeTruthy()
     expect(onFinished).toHaveBeenCalledTimes(1)
-    expect(localStorage.getItem('rra.automationKey')).toBe('secret-key')
 
     // Failed reviews with reasons.
     fireEvent.click(screen.getByRole('button', { name: /Show failed reviews \(1\)/ }))
@@ -279,13 +273,12 @@ describe('BulkReplyPanel progress and completion', () => {
   })
 
   it('can stop the job after the current review', async () => {
-    localStorage.setItem('rra.automationKey', 'secret-key')
     localStorage.setItem(`rra.backfillJob.${LOCATION}`, 'job1')
     mocked.getBackfill.mockResolvedValue(job())
     mocked.cancelBackfill.mockResolvedValue(job({ cancel_requested: true }))
     renderPanel()
     fireEvent.click(await screen.findByRole('button', { name: 'Stop after current review' }))
-    await waitFor(() => expect(mocked.cancelBackfill).toHaveBeenCalledWith('job1', 'secret-key'))
+    await waitFor(() => expect(mocked.cancelBackfill).toHaveBeenCalledWith('job1'))
   })
 })
 
@@ -297,13 +290,6 @@ describe('BulkReplyPanel errors', () => {
     await confirmStart()
     return handlers
   }
-
-  it('wrong admin key', async () => {
-    localStorage.setItem('rra.automationKey', 'old')
-    await startWith(new ApiError('denied', 403, 'The admin key is missing or incorrect.'))
-    expect((await screen.findByRole('alert')).textContent).toBe('The admin key is incorrect.')
-    expect(localStorage.getItem('rra.automationKey')).toBeNull()
-  })
 
   it('network error / backend unavailable', async () => {
     await startWith(new ApiError('Cannot reach the server. Check your connection and that the backend is running.', 0))

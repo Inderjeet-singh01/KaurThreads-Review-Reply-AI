@@ -118,20 +118,18 @@ export const api = {
   // --- Automation --------------------------------------------------------
   getAutomationStatus: () => request<AutomationStatus>('/automation/status'),
 
-  /** Start replying to every pending review. `adminKey` = AUTOMATION_BACKFILL_KEY. */
-  startBackfill: (locationId: string | null | undefined, adminKey: string) =>
+  /** Start replying to every pending review (runs in the background on the server). */
+  startBackfill: (locationId?: string | null) =>
     request<BackfillStartResponse>(withLocation('/automation/backfill', locationId), {
       method: 'POST',
-      headers: { 'X-Automation-Key': adminKey },
     }),
   getBackfill: (jobId: string) =>
     request<BackfillJob>(`/automation/backfill/${encodeURIComponent(jobId)}`),
   getLatestBackfill: (locationId?: string | null) =>
     request<{ job: BackfillJob | null }>(withLocation('/automation/backfill', locationId)),
-  cancelBackfill: (jobId: string, adminKey: string) =>
+  cancelBackfill: (jobId: string) =>
     request<BackfillJob>(`/automation/backfill/${encodeURIComponent(jobId)}/cancel`, {
       method: 'POST',
-      headers: { 'X-Automation-Key': adminKey },
     }),
 
   // --- Locations ----------------------------------------------------------

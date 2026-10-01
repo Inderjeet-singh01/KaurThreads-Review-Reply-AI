@@ -33,7 +33,6 @@ from tests.test_automation import (
     AutomationTestCase,
 )
 
-ADMIN_KEY = "test-admin-key"
 # The real helper, captured before BackfillTestCase patches it.
 _REAL_LIST_PENDING = backfill._list_pending
 
@@ -54,7 +53,6 @@ class BackfillTestCase(AutomationTestCase):
         self.addCleanup(backfill.reset_state)
         self._patch_settings(
             automation_backfill_delay_seconds=0,
-            automation_backfill_key=ADMIN_KEY,
         )
         # Google state per review id; get_review always reads the latest.
         self.google: dict[str, dict] = {}
@@ -424,10 +422,9 @@ class BackfillApiTests(BackfillTestCase):
     async def asyncTearDown(self):
         await self.http.aclose()
 
-    async def start(self, key: str | None = ADMIN_KEY, location: str | None = LOCATION_ID):
-        headers = {"X-Automation-Key": key} if key else {}
+    async def start(self, location: str | None = LOCATION_ID):
         params = {"location_id": location} if location else {}
-        return await self.http.post("/automation/backfill", headers=headers, params=params)
+        return await self.http.post("/automation/backfill", params=params)
 
     # 10 / 11
     async def test_start_then_poll_until_completed(self):
@@ -475,23 +472,22 @@ class BackfillApiTests(BackfillTestCase):
         self.assertEqual(body["total_reviews"], 0)
         self.assertIn("no pending reviews", body["reason"])
 
-    async def test_admin_key_is_required(self):
+    async def test_start_and_cancel_need_no_key(self):
         self.set_reviews("a")
-        self.assertEqual((await self.start(key=None)).status_code, 403)
-        self.assertEqual((await self.start(key="wrong")).status_code, 403)
-        self.list_pending.assert_not_called()
-        self._patch_settings(automation_backfill_key="")
+        release = threading.Event()
+        self.get_review.side_effect = lambda rid, location_id=None: (
+            release.wait(5), self.google[rid])[1]
         response = await self.start()
-        self.assertEqual(response.status_code, 503)
-        self.list_pending.assert_not_called()
-
-    async def test_cancel_requires_admin_key(self):
-        response = await self.http.post("/automation/backfill/x/cancel")
-        self.assertEqual(response.status_code, 403)
-        response = await self.http.post(
-            "/automation/backfill/x/cancel", headers={"X-Automation-Key": ADMIN_KEY}
+        self.assertEqual(response.status_code, 202)
+        job_id = response.json()["job_id"]
+        cancel = await self.http.post(f"/automation/backfill/{job_id}/cancel")
+        self.assertEqual(cancel.status_code, 200)
+        self.assertTrue(cancel.json()["cancel_requested"])
+        release.set()
+        await backfill.wait_for_job(job_id, timeout=10)
+        self.assertEqual(
+            (await self.http.post("/automation/backfill/unknown/cancel")).status_code, 404
         )
-        self.assertEqual(response.status_code, 404)
 
     async def test_google_errors_when_listing(self):
         self.list_pending.side_effect = GoogleAPIError("Google API request failed", status=500)
@@ -507,8 +503,6 @@ class BackfillApiTests(BackfillTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertFalse(response.json()["started"])
 
-    async def test_automation_status_reports_backfill_config_without_the_key(self):
+    async def test_automation_status_reports_backfill_delay(self):
         body = (await self.http.get("/automation/status")).json()
-        self.assertTrue(body["backfill_configured"])
         self.assertEqual(body["backfill_delay_seconds"], 0)
-        self.assertNotIn(ADMIN_KEY, str(body))

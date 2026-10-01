@@ -21,7 +21,6 @@ import { classNames } from '../lib/utils'
 export const DEFAULT_POLL_INTERVAL_MS = 3000
 /** Consecutive polling failures before the panel stops and asks to retry. */
 const MAX_POLL_FAILURES = 5
-const ADMIN_KEY_STORAGE = 'rra.automationKey'
 const jobStorageKey = (locationId: string | null) => `rra.backfillJob.${locationId ?? 'default'}`
 
 function readStorage(key: string): string | null {
@@ -49,7 +48,6 @@ function backfillErrorMessage(err: unknown): string {
   if (!(err instanceof ApiError)) return 'Something went wrong. Please try again.'
   if (err.status === 0) return err.message
   if (err.status === 401) return 'Your Google session has expired. Please reconnect your account.'
-  if (err.status === 403 && err.detail.includes('admin key')) return 'The admin key is incorrect.'
   if ([403, 409, 503].includes(err.status) && err.detail) return err.detail
   return err.message
 }
@@ -101,7 +99,6 @@ export function BulkReplyPanel({
   const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  const [adminKey, setAdminKey] = useState(() => readStorage(ADMIN_KEY_STORAGE) ?? '')
   const [cancelling, setCancelling] = useState(false)
   const notifiedJobs = useRef(new Set<string>())
   const storageKey = jobStorageKey(locationId)
@@ -193,16 +190,10 @@ export function BulkReplyPanel({
   )
 
   const handleStart = async () => {
-    const key = adminKey.trim()
-    if (!key) {
-      setStartError('Enter the admin key to start the bulk reply.')
-      return
-    }
     setStarting(true)
     setStartError(null)
     try {
-      const result = await api.startBackfill(locationId, key)
-      writeStorage(ADMIN_KEY_STORAGE, key)
+      const result = await api.startBackfill(locationId)
       setConfirmOpen(false)
       setInterrupted(false)
       if (result.started && result.job_id) {
@@ -221,7 +212,6 @@ export function BulkReplyPanel({
         setConfirmOpen(false)
         onAuthExpired()
       } else {
-        if (err instanceof ApiError && err.status === 403) writeStorage(ADMIN_KEY_STORAGE, null)
         setStartError(backfillErrorMessage(err))
       }
     } finally {
@@ -233,7 +223,7 @@ export function BulkReplyPanel({
     if (!job) return
     setCancelling(true)
     try {
-      setJob(await api.cancelBackfill(job.job_id, readStorage(ADMIN_KEY_STORAGE) ?? ''))
+      setJob(await api.cancelBackfill(job.job_id))
     } catch (err) {
       setNotice(`Could not stop the bulk reply: ${backfillErrorMessage(err)}`)
     } finally {
@@ -252,7 +242,7 @@ export function BulkReplyPanel({
         job={job}
         connectionLost={pollFailures >= MAX_POLL_FAILURES}
         onRetry={() => setPollFailures(0)}
-        onCancel={readStorage(ADMIN_KEY_STORAGE) ? handleCancel : undefined}
+        onCancel={handleCancel}
         cancelling={cancelling}
         notice={notice}
       />
@@ -266,9 +256,7 @@ export function BulkReplyPanel({
       ? null
       : !automation.enabled
         ? 'Automatic replies are disabled on the server (AUTO_REPLY_ENABLED=false).'
-        : !automation.backfill_configured
-          ? 'Bulk reply is not configured on the server (AUTOMATION_BACKFILL_KEY is not set).'
-          : null
+        : null
   const disabled = !automation || !!disabledReason || pendingCount === 0
 
   return (
@@ -320,8 +308,6 @@ export function BulkReplyPanel({
         <ConfirmBulkDialog
           pendingCount={pendingCount}
           dryRun={automation.dry_run}
-          adminKey={adminKey}
-          onAdminKeyChange={setAdminKey}
           error={startError}
           busy={starting}
           onConfirm={handleStart}
@@ -335,8 +321,6 @@ export function BulkReplyPanel({
 function ConfirmBulkDialog({
   pendingCount,
   dryRun,
-  adminKey,
-  onAdminKeyChange,
   error,
   busy,
   onConfirm,
@@ -344,8 +328,6 @@ function ConfirmBulkDialog({
 }: {
   pendingCount: number
   dryRun: boolean
-  adminKey: string
-  onAdminKeyChange: (value: string) => void
   error: string | null
   busy: boolean
   onConfirm: () => void
@@ -386,19 +368,6 @@ function ConfirmBulkDialog({
             Replies will be published to Google.
           </p>
         )}
-        <label className="mt-4 block text-sm font-medium text-slate-700" htmlFor="bulk-admin-key">
-          Admin key
-        </label>
-        <input
-          id="bulk-admin-key"
-          type="password"
-          autoComplete="off"
-          className="input mt-1"
-          placeholder="AUTOMATION_BACKFILL_KEY"
-          value={adminKey}
-          onChange={(e) => onAdminKeyChange(e.target.value)}
-          disabled={busy}
-        />
         {error && (
           <p role="alert" className="mt-3 text-sm text-rose-600">
             {error}

@@ -69,8 +69,7 @@ if settings.auto_reply_enabled and not pubsub_auth_configured():
         "PUBSUB_PUSH_SERVICE_ACCOUNT are not set: the webhook rejects every request"
     )
 logger.info(
-    "Bulk backfill: configured=%s delay_seconds=%s",
-    bool(settings.automation_backfill_key), settings.automation_backfill_delay_seconds,
+    "Bulk backfill: delay_seconds=%s", settings.automation_backfill_delay_seconds,
 )
 if settings.automation_test_endpoint_enabled:
     logger.warning(

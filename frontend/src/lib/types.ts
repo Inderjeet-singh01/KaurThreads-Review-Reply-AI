@@ -74,7 +74,6 @@ export interface AutomationStatus {
   location_ids: string[]
   webhook_auth_configured: boolean
   test_endpoint_enabled: boolean
-  backfill_configured: boolean
   backfill_delay_seconds: number
 }
 

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hmac
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from app.api.reviews import _to_http_error
@@ -31,34 +30,12 @@ def automation_status() -> dict[str, Any]:
         "location_ids": settings.auto_reply_location_list,
         "webhook_auth_configured": pubsub_auth_configured(),
         "test_endpoint_enabled": settings.automation_test_endpoint_enabled,
-        "backfill_configured": bool(settings.automation_backfill_key),
         "backfill_delay_seconds": settings.automation_backfill_delay_seconds,
     }
 
 
 # --- Bulk backfill ----------------------------------------------------------------
-def require_backfill_key(
-    x_automation_key: str | None = Header(None, description="AUTOMATION_BACKFILL_KEY"),
-) -> None:
-    """Shared admin key for starting / cancelling a backfill.
-
-    The app has no user accounts and a backfill can publish many replies,
-    so these endpoints fail closed: disabled while AUTOMATION_BACKFILL_KEY is
-    empty, 403 for a missing or wrong key (401 is reserved for Google OAuth).
-    """
-    expected = settings.automation_backfill_key
-    if not expected:
-        raise HTTPException(
-            status_code=503,
-            detail="Bulk reply is not configured on the server (AUTOMATION_BACKFILL_KEY is not set).",
-        )
-    if not x_automation_key or not hmac.compare_digest(
-        x_automation_key.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise HTTPException(status_code=403, detail="The admin key is missing or incorrect.")
-
-
-@router.post("/backfill", dependencies=[Depends(require_backfill_key)])
+@router.post("/backfill")
 async def start_backfill(
     location_id: str | None = Query(
         None, description="Business Profile location id. Defaults to the configured / first location."
@@ -114,7 +91,7 @@ def backfill_status(job_id: str) -> dict[str, Any]:
     return job.summary()
 
 
-@router.post("/backfill/{job_id}/cancel", dependencies=[Depends(require_backfill_key)])
+@router.post("/backfill/{job_id}/cancel")
 def cancel_backfill(job_id: str) -> dict[str, Any]:
     """Stop starting new reviews; a review already in progress finishes normally."""
     job = backfill.cancel_backfill(job_id)
