@@ -9,7 +9,13 @@ export function formatRelativeDate(iso: string | null): string {
   const diffMs = now - date.getTime()
   const day = 24 * 60 * 60 * 1000
 
-  if (diffMs < 0) return formatFullDate(iso)
+  // Small negative skew (client clock slightly behind the server) is "now".
+  if (diffMs < -5 * 60 * 1000) return formatFullDate(iso)
+  const minutes = Math.floor(Math.max(0, diffMs) / 60000)
+  if (minutes < 1) return 'Just now'
+  if (minutes < 60) return minutes === 1 ? '1 minute ago' : `${minutes} minutes ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return hours === 1 ? '1 hour ago' : `${hours} hours ago`
   const days = Math.floor(diffMs / day)
   if (days === 0) return 'Today'
   if (days === 1) return 'Yesterday'
@@ -31,6 +37,40 @@ export function formatFullDate(iso: string | null): string {
     month: 'short',
     day: 'numeric',
   })
+}
+
+/** Date with time of day: "Sep 26, 2026, 4:32 PM". */
+export function formatDateTime(iso: string | null): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+/**
+ * Exact time plus a relative hint: "Sep 29, 2026, 4:32 PM · 2 days ago".
+ * The hint is dropped once it would only repeat the date (older than a year).
+ */
+export function formatTimeWithRelative(iso: string | null): string {
+  const exact = formatDateTime(iso)
+  if (!exact) return ''
+  const relative = formatRelativeDate(iso)
+  return relative && relative !== formatFullDate(iso)
+    ? `${exact} · ${relative.toLowerCase()}`
+    : exact
+}
+
+/** Milliseconds since epoch for sorting; missing/invalid dates sort as 0. */
+export function timestamp(iso: string | null): number {
+  if (!iso) return 0
+  const time = new Date(iso).getTime()
+  return Number.isNaN(time) ? 0 : time
 }
 
 /** Initials from a display name, e.g. "Priya Sharma" -> "P". */

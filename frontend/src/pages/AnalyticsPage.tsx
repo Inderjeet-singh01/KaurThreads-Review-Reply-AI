@@ -44,7 +44,7 @@ export function AnalyticsPage({ onAuthExpired }: { onAuthExpired: () => void }) 
       {loading ? (
         <ReviewListSkeleton count={3} />
       ) : error ? (
-        <ErrorState message={error} onRetry={refresh} />
+        <ErrorState message={error} onRetry={() => void refresh()} />
       ) : (
         <>
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">

@@ -1,6 +1,6 @@
 import { ExternalLink, Sparkles } from 'lucide-react'
 import type { Review } from '../lib/types'
-import { formatRelativeDate } from '../lib/utils'
+import { formatRelativeDate, formatTimeWithRelative } from '../lib/utils'
 import { Avatar } from './Avatar'
 import { RatingStars } from './RatingStars'
 import { StatusBadge } from './StatusBadge'
@@ -63,11 +63,21 @@ export function ReviewCard({
             </p>
           )}
 
-          {showReply && review.reply_comment && (
+          {showReply && review.has_reply && (
             <div className="mt-3 rounded-lg border border-slate-100 bg-slate-50 px-3.5 py-3">
-              <p className="text-xs font-semibold text-slate-700">Your Reply:</p>
-              <p className="mt-1 text-sm leading-relaxed text-slate-600">
-                {review.reply_comment}
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+                <p className="text-xs font-semibold text-slate-700">Your Reply</p>
+                {review.reply_updated_at && (
+                  <time
+                    dateTime={review.reply_updated_at}
+                    className="text-xs text-slate-400"
+                  >
+                    Replied {formatTimeWithRelative(review.reply_updated_at)}
+                  </time>
+                )}
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed text-slate-600">
+                {review.reply_comment || 'Reply posted to Google.'}
               </p>
             </div>
           )}

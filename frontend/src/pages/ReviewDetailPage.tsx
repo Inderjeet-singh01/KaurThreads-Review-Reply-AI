@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowLeft,
   Check,
@@ -33,15 +33,22 @@ import { ReplyEditorModal } from '../components/ReplyEditorModal'
 import { ConfirmDialog } from '../components/ConfirmDialog'
 import { EmptyState } from '../components/EmptyState'
 import { ErrorState } from '../components/ErrorState'
-import { formatFullDate, formatRelativeDate, googleMapsUrl } from '../lib/utils'
+import {
+  formatDateTime,
+  formatFullDate,
+  formatRelativeDate,
+  formatTimeWithRelative,
+  googleMapsUrl,
+} from '../lib/utils'
 
 export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void }) {
   const { reviewId = '' } = useParams()
   const navigate = useNavigate()
+  const routerLocation = useLocation()
   const toast = useToast()
   const { business } = useBusiness()
   const locationId = business?.location_id ?? null
-  const { getReview, loading: listLoading, applyReviewUpdate, refresh } = useReviews()
+  const { getReview, loading: listLoading, markReplied, refresh } = useReviews()
 
   const [review, setReview] = useState<Review | undefined>(() => getReview(reviewId))
   const [reply, setReply] = useState('')
@@ -129,7 +136,7 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
       setValidationError(detail ? `${message} ${detail}` : message)
       toast.error(message)
       // Answered elsewhere: resync so the page switches to the posted reply.
-      if (alreadyAnswered) void refresh()
+      if (alreadyAnswered) void refresh({ silent: true })
     } finally {
       setValidating(false)
     }
@@ -150,18 +157,13 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
     setPosting(true)
     try {
       const res = await api.publishReply(reviewId, text, locationId)
-      if (review) {
-        applyReviewUpdate({
-          ...review,
-          has_reply: true,
-          reply_comment: res.reply ?? text,
-          reply_updated_at: new Date().toISOString(),
-        })
-      }
+      // Counts and lists update at once; the background refresh then picks up
+      // Google's stored reply (and its timestamp) without blanking the page.
+      markReplied([{ reviewId, reply: res.reply ?? text }])
       toast.success('Reply posted to Google.')
       setEditorOpen(false)
       setConfirmOpen(false)
-      void refresh()
+      void refresh({ silent: true })
       navigate('/dashboard')
     } catch (err) {
       if (handleAuthError(err)) return
@@ -169,7 +171,7 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
       toast.error(message)
       // If it was already answered elsewhere, resync and leave the detail view.
       if (err instanceof ApiError && err.status === 409) {
-        void refresh()
+        void refresh({ silent: true })
         navigate('/dashboard')
       }
       setConfirmOpen(false)
@@ -205,10 +207,13 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
   const currentValidation =
     validationResult && validationResult.text === reply ? validationResult.result : null
   const googleUrl = business ? googleMapsUrl(business.name, business.address) : undefined
+  // Opened directly (new tab / bookmark): there is no in-app page to go back to.
+  const goBack = () =>
+    routerLocation.key === 'default' ? navigate('/dashboard') : navigate(-1)
 
   return (
     <div className="space-y-5">
-      <BackLink onClick={() => navigate(-1)} />
+      <BackLink onClick={goBack} />
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         {/* LEFT: customer review */}
@@ -266,6 +271,11 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
               <DetailRow label="Status">
                 <StatusBadge status={alreadyReplied ? 'replied' : 'needs-reply'} />
               </DetailRow>
+              {alreadyReplied && review.reply_updated_at && (
+                <DetailRow label="Replied">
+                  <span className="text-slate-700">{formatDateTime(review.reply_updated_at)}</span>
+                </DetailRow>
+              )}
             </dl>
           </section>
         </div>
@@ -438,7 +448,7 @@ function AlreadyRepliedPanel({ review }: { review: Review }) {
       </div>
       {review.reply_updated_at && (
         <p className="mt-3 text-xs text-slate-400">
-          Replied on {formatFullDate(review.reply_updated_at)}
+          Replied on {formatTimeWithRelative(review.reply_updated_at)}
         </p>
       )}
       <p className="mt-4 rounded-lg bg-slate-50 px-3.5 py-3 text-xs text-slate-500">

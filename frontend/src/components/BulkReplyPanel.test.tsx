@@ -339,3 +339,58 @@ describe('BulkReplyPanel errors', () => {
     expect(((await startButton()) as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+describe('BulkReplyPanel live updates and re-runs', () => {
+  it('reports each review as soon as it is published, not only at the end', async () => {
+    localStorage.setItem(`rra.backfillJob.${LOCATION}`, 'job1')
+    mocked.getBackfill
+      .mockResolvedValueOnce(job({ items: [item({ review_id: 'a' }), item({ review_id: 'b', outcome: 'PROCESSING' })] }))
+      .mockResolvedValueOnce(job({ items: [item({ review_id: 'a' }), item({ review_id: 'b' })] }))
+      .mockResolvedValue(completed({ items: [item({ review_id: 'a' }), item({ review_id: 'b' })] }))
+    const onReviewsPublished = vi.fn()
+    renderPanel({ onReviewsPublished })
+    expect(await screen.findByText('Bulk reply completed')).toBeTruthy()
+    // Once per review, in the poll where it was published.
+    expect(onReviewsPublished.mock.calls).toEqual([[['a']], [['b']]])
+  })
+
+  it('never reports dry-run reviews as published', async () => {
+    localStorage.setItem(`rra.backfillJob.${LOCATION}`, 'job1')
+    mocked.getBackfill.mockResolvedValue(
+      completed({ dry_run: true, items: [item({ outcome: 'DRY_RUN', final_status: 'DRY_RUN' })] }),
+    )
+    const onReviewsPublished = vi.fn()
+    renderPanel({ onReviewsPublished })
+    expect(await screen.findByText('Bulk reply completed')).toBeTruthy()
+    expect(onReviewsPublished).not.toHaveBeenCalled()
+  })
+
+  it('lists skipped reviews with a reason and the reviewer name', async () => {
+    localStorage.setItem(`rra.backfillJob.${LOCATION}`, 'job1')
+    mocked.getBackfill.mockResolvedValue(
+      completed({
+        items: [
+          item({ review_id: 's1', outcome: 'SKIPPED', final_status: 'SKIPPED_ALREADY_REPLIED' }),
+        ],
+      }),
+    )
+    renderPanel({ reviewLabel: (id) => (id === 's1' ? 'Priya Sharma' : undefined) })
+    fireEvent.click(await screen.findByRole('button', { name: /Show skipped reviews \(1\)/ }))
+    expect(screen.getByText('Priya Sharma')).toBeTruthy()
+    expect(screen.getByText(/already answered on Google/)).toBeTruthy()
+  })
+
+  it('can start again for the remaining reviews straight from the result', async () => {
+    localStorage.setItem(`rra.backfillJob.${LOCATION}`, 'job1')
+    mocked.getBackfill.mockResolvedValueOnce(completed())
+    mocked.startBackfill.mockResolvedValue({ started: true, job_id: 'job2', total_reviews: 8 })
+    renderPanel({ pendingCount: 8 })
+    expect(await screen.findByText('Bulk reply completed')).toBeTruthy()
+    expect(screen.getByText('8 reviews are still unanswered.')).toBeTruthy()
+    mocked.getBackfill.mockResolvedValue(job({ job_id: 'job2', total: 8, processed: 0 }))
+    fireEvent.click(await startButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Start Bulk Reply' }))
+    expect(await screen.findByText('Bulk Reply in Progress')).toBeTruthy()
+    expect(mocked.startBackfill).toHaveBeenCalledWith(LOCATION)
+  })
+})

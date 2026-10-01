@@ -186,6 +186,19 @@ def reset_state() -> None:
     _retryable_failures.clear()
 
 
+def forget_review(review_id: str) -> None:
+    """Drop the outcome memory and retry budget of one review.
+
+    For explicit user actions (the bulk "reply to all" backfill): the user
+    asked to try again, so a review that failed validation, exhausted its
+    retries, or was only dry-run earlier must be processed afresh instead of
+    being skipped as a DUPLICATE for 24 hours. The per-review lock and both
+    Google "already replied" checks still apply.
+    """
+    _recent_outcomes.pop(review_id, None)
+    _retryable_failures.pop(review_id, None)
+
+
 def _recent_outcome(review_id: str) -> AutomationStatus | None:
     entry = _recent_outcomes.get(review_id)
     if entry is None:

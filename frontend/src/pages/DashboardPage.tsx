@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   ChevronDown,
@@ -29,7 +29,8 @@ export function DashboardPage({
   onAuthExpired: () => void
 }) {
   const { business } = useBusiness()
-  const { unanswered, reviews, stats, loading, error, isAuthError, refresh } = useReviews()
+  const { unanswered, reviews, stats, loading, error, isAuthError, refresh, markReplied, getReview } =
+    useReviews()
   const navigate = useNavigate()
 
   const [tab, setTab] = useState<Tab>(defaultTab)
@@ -56,6 +57,21 @@ export function DashboardPage({
       )
     })
   }, [source, query, ratingFilter])
+
+  // Bulk reply: count each review as answered the moment it is published,
+  // then re-read Google in the background when the job ends (no skeletons).
+  const handleBulkPublished = useCallback(
+    (ids: string[]) => markReplied(ids.map((reviewId) => ({ reviewId }))),
+    [markReplied],
+  )
+  const handleBulkFinished = useCallback(() => void refresh({ silent: true }), [refresh])
+  const reviewLabel = useCallback(
+    (id: string) => {
+      const r = getReview(id)
+      return r ? `${r.reviewer}${r.rating ? ` (${r.rating}★)` : ''}` : undefined
+    },
+    [getReview],
+  )
 
   const openReview = (r: Review) => navigate(`/reviews/${encodeURIComponent(r.review_id)}`)
 
@@ -98,7 +114,9 @@ export function DashboardPage({
       <BulkReplyPanel
         locationId={business?.location_id ?? null}
         pendingCount={loading || error ? 0 : unanswered.length}
-        onFinished={refresh}
+        onFinished={handleBulkFinished}
+        onReviewsPublished={handleBulkPublished}
+        reviewLabel={reviewLabel}
         onAuthExpired={onAuthExpired}
       />
 
@@ -156,7 +174,7 @@ export function DashboardPage({
           </div>
         ) : error ? (
           <div className="p-5">
-            <ErrorState message={error} onRetry={refresh} />
+            <ErrorState message={error} onRetry={() => void refresh()} />
           </div>
         ) : filtered.length === 0 ? (
           <div className="p-5">

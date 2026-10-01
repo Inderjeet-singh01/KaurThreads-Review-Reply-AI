@@ -42,6 +42,7 @@ from app.automation.processor import (
     AutomationRun,
     AutomationStatus,
     _location_allowed,
+    forget_review,
     process_new_review,
 )
 from app.config import settings
@@ -332,10 +333,14 @@ async def _process_item(job: BackfillJob, item: BackfillItem) -> None:
     bounded twice over. No reply is ever published twice: every attempt
     starts with a fresh Google fetch and "already replied" check.
     """
-    delay = settings.automation_backfill_delay_seconds
+    retry_delay = settings.automation_backfill_retry_delay_seconds
     item.started_at = _now()
     item.outcome = BackfillOutcome.PROCESSING
     logger.info("BACKFILL job=%s review=%s status=PROCESSING", job.job_id, item.review_id)
+    # The user explicitly asked to reply to every pending review: earlier
+    # outcomes (failed validation, exhausted retries, a dry run) must not make
+    # this review a DUPLICATE skip on every later "reply to all".
+    forget_review(item.review_id)
     for attempt in range(1, MAX_PROCESSING_ATTEMPTS + 1):
         item.attempts = attempt
         run = await process_new_review(item.review_id, job.location_id)
@@ -346,7 +351,7 @@ async def _process_item(job: BackfillJob, item: BackfillItem) -> None:
             "BACKFILL job=%s review=%s attempt=%d status=%s stage=%s retrying",
             job.job_id, item.review_id, attempt, run.status.value, run.error_stage,
         )
-        await _pause(job, delay * attempt)
+        await _pause(job, retry_delay * attempt)
         if job.cancel_event.is_set():
             break
     item.finished_at = _now()

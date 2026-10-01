@@ -53,6 +53,7 @@ class BackfillTestCase(AutomationTestCase):
         self.addCleanup(backfill.reset_state)
         self._patch_settings(
             automation_backfill_delay_seconds=0,
+            automation_backfill_retry_delay_seconds=0,
         )
         # Google state per review id; get_review always reads the latest.
         self.google: dict[str, dict] = {}
@@ -313,6 +314,46 @@ class BackfillSafetyTests(BackfillTestCase):
         job = next(r for r in results if not isinstance(r, Exception))
         await backfill.wait_for_job(job.job_id, timeout=10)
         self.publish.assert_called_once()
+
+    async def test_rerun_retries_reviews_that_failed_validation(self):
+        # Reported bug: reviews that failed in one "reply to all" were skipped
+        # as DUPLICATE ("recently processed") on every later click.
+        self.set_reviews("a")
+        self.validate.side_effect = [FAIL, FAIL, PASS]
+        first = await self.run_backfill()
+        self.assertEqual(self.items(first)["a"]["outcome"], "FAILED")
+        second = await self.run_backfill()
+        item = self.items(second)["a"]
+        self.assertEqual(item["outcome"], "PUBLISHED")
+        self.assertEqual(second["skipped"], 0)
+        self.publish.assert_called_once()
+
+    async def test_rerun_retries_reviews_whose_retry_budget_was_exhausted(self):
+        self.set_reviews("a")
+        self.google["a"] = GoogleAPIError("Service unavailable", status=503)
+        first = await self.run_backfill()
+        self.assertEqual(self.items(first)["a"]["outcome"], "FAILED")
+        self.google["a"] = _review("a")  # Google recovered
+        second = await self.run_backfill()
+        self.assertEqual(self.items(second)["a"]["outcome"], "PUBLISHED")
+
+    async def test_live_run_after_dry_run_publishes(self):
+        self.set_reviews("a")
+        self._patch_settings(auto_reply_dry_run=True)
+        first = await self.run_backfill()
+        self.assertEqual(first["would_publish"], 1)
+        self._patch_settings(auto_reply_dry_run=False)
+        second = await self.run_backfill()
+        self.assertEqual(second["published"], 1)
+        self.publish.assert_called_once()
+
+    async def test_retries_wait_the_retry_delay_times_attempt(self):
+        self._patch_settings(automation_backfill_retry_delay_seconds=15)
+        self.set_reviews("a")
+        self.google["a"] = GoogleAPIError("Service unavailable", status=503)
+        with mock.patch.object(backfill, "_pause", new=mock.AsyncMock()) as pause:
+            await self.run_backfill()
+        self.assertEqual([c.args[1] for c in pause.await_args_list], [15, 30])
 
     async def test_new_backfill_allowed_after_completion(self):
         self.set_reviews("a")

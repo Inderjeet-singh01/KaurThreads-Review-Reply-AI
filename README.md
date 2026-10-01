@@ -173,6 +173,7 @@ Copy `.env.example` to `.env` and fill it in:
 | `PUBSUB_PUSH_SERVICE_ACCOUNT` | for automation | Expected `email` of the Pub/Sub push JWT. |
 | `AUTOMATION_TEST_ENDPOINT_ENABLED` | no | Development only: exposes `POST /automation/test/{review_id}`. Default `false`. |
 | `AUTOMATION_BACKFILL_DELAY_SECONDS` | no | Pause between reviews of a bulk reply (rate limits). Default `2`, max `60`. |
+| `AUTOMATION_BACKFILL_RETRY_DELAY_SECONDS` | no | Base wait before retrying a review after a transient failure, multiplied by the attempt number. Default `15`, max `300`. |
 
 \* At least one of `GROQ_API_KEY` / `GEMINI_API_KEY` is required; set both for
 automatic fallback.
@@ -601,6 +602,7 @@ Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
 | `AUTO_REPLY_LOCATION_IDS` | optional allowlist |
 | `AUTOMATION_TEST_ENDPOINT_ENABLED` | `false` in production |
 | `AUTOMATION_BACKFILL_DELAY_SECONDS` | optional, default `2` |
+| `AUTOMATION_BACKFILL_RETRY_DELAY_SECONDS` | optional, default `15` |
 
 The webhook rejects every request while either `PUBSUB_PUSH_*` value is
 empty. The JWT is never logged.
@@ -719,9 +721,14 @@ POST /automation/backfill/{job_id}/cancel       stop after the current review
 - **Sequential:** one review at a time, `AUTOMATION_BACKFILL_DELAY_SECONDS`
   between reviews. A failed review is recorded and the batch continues.
 - **Retries:** a retryable failure (Google 5xx/429, AI provider outage) is
-  retried up to `MAX_PROCESSING_ATTEMPTS` (3) with a growing pause; the
-  processor's shared retry budget applies. A validation FAIL after the one
-  regeneration is final (left for a manual reply).
+  retried up to `MAX_PROCESSING_ATTEMPTS` (3), waiting
+  `AUTOMATION_BACKFILL_RETRY_DELAY_SECONDS` × attempt (15 s, then 30 s) so
+  per-minute AI quotas can recover. A validation FAIL after the one
+  regeneration is final for that run (left for a manual reply).
+- **Every click is a fresh try:** a bulk reply is an explicit user action, so
+  it clears the processor's "recently finished" memory and retry budget for
+  each review it processes. Reviews that failed (or were only dry-run) in an
+  earlier run are processed again instead of being skipped as duplicates.
 - **No double replies:** every attempt re-reads the review from Google and
   checks again right before publishing; only one backfill can run at a
   time (a second start returns `409 {"started": false, "reason": "A

@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # Bulk "reply to all pending reviews" (POST /automation/backfill):
     # pause between two reviews of a backfill (Groq / Google rate limits).
     automation_backfill_delay_seconds: float = Field(default=2.0, ge=0, le=60)
+    # Base wait before retrying a review after a transient failure (AI rate
+    # limit, Google 5xx); multiplied by the attempt number. AI quotas are per
+    # minute, so a short pause would just fail again.
+    automation_backfill_retry_delay_seconds: float = Field(default=15.0, ge=0, le=300)
 
     @property
     def auto_reply_location_list(self) -> list[str]:

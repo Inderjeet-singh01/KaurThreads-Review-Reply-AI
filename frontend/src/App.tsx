@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes, useParams } from 'react-router-dom'
 import { api } from './lib/api'
 import { useBusiness } from './context/BusinessContext'
 import { ReviewsProvider } from './context/ReviewsContext'
@@ -58,9 +58,11 @@ export default function App() {
       />
 
       <Route element={<ProtectedShell authed={authed} />}>
-        <Route path="/dashboard" element={<DashboardPage defaultTab="unanswered" onAuthExpired={onAuthExpired} />} />
-        <Route path="/reviews" element={<DashboardPage defaultTab="all" onAuthExpired={onAuthExpired} />} />
-        <Route path="/reviews/:reviewId" element={<ReviewDetailPage onAuthExpired={onAuthExpired} />} />
+        {/* Distinct keys: both routes render DashboardPage, and without them
+            React would reuse one instance and keep the previous tab. */}
+        <Route path="/dashboard" element={<DashboardPage key="dashboard" defaultTab="unanswered" onAuthExpired={onAuthExpired} />} />
+        <Route path="/reviews" element={<DashboardPage key="reviews" defaultTab="all" onAuthExpired={onAuthExpired} />} />
+        <Route path="/reviews/:reviewId" element={<ReviewDetailRoute onAuthExpired={onAuthExpired} />} />
         <Route path="/replied" element={<RepliedReviewsPage onAuthExpired={onAuthExpired} />} />
         <Route path="/analytics" element={<AnalyticsPage onAuthExpired={onAuthExpired} />} />
         <Route path="/settings" element={<SettingsPage onAuthExpired={onAuthExpired} />} />
@@ -69,6 +71,12 @@ export default function App() {
       <Route path="*" element={<Navigate to={authed ? '/dashboard' : '/login'} replace />} />
     </Routes>
   )
+}
+
+/** Fresh detail state (draft, validation, auto-generation) per review id. */
+function ReviewDetailRoute({ onAuthExpired }: { onAuthExpired: () => void }) {
+  const { reviewId = '' } = useParams()
+  return <ReviewDetailPage key={reviewId} onAuthExpired={onAuthExpired} />
 }
 
 function ProtectedShell({ authed }: { authed: boolean }) {

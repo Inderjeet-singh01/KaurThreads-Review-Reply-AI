@@ -66,6 +66,21 @@ const STAGE_LABELS: Record<string, string> = {
 
 const shortId = (id: string) => (id.length > 12 ? `${id.slice(0, 10)}…` : id)
 
+const SKIP_LABELS: Record<string, string> = {
+  SKIPPED_ALREADY_REPLIED: 'already answered on Google',
+  SKIPPED_NOT_FOUND: 'no longer on Google',
+  DISABLED: 'automatic replies were turned off',
+  IGNORED: 'location not enabled for automatic replies',
+}
+
+function skipReason(item: BackfillItem): string {
+  return (
+    (item.final_status && SKIP_LABELS[item.final_status]) ||
+    (item.error ?? '').replace(/^[A-Za-z]+(Error|Exception): /, '').slice(0, 160) ||
+    'skipped'
+  )
+}
+
 function failureReason(item: BackfillItem): string {
   const stage = item.error_stage ? STAGE_LABELS[item.error_stage] ?? item.error_stage : ''
   // Backend errors are secret-free; drop the exception class prefix and trim.
@@ -79,6 +94,13 @@ interface BulkReplyPanelProps {
   pendingCount: number
   /** Called once when a job finishes, so the review list can refresh. */
   onFinished: () => void
+  /**
+   * Called with the ids of reviews that were just published, while the job
+   * is still running, so counts and lists can update review by review.
+   */
+  onReviewsPublished?: (reviewIds: string[]) => void
+  /** Human label (e.g. reviewer name) for a review id in the result lists. */
+  reviewLabel?: (reviewId: string) => string | undefined
   onAuthExpired: () => void
   pollIntervalMs?: number
 }
@@ -87,6 +109,8 @@ export function BulkReplyPanel({
   locationId,
   pendingCount,
   onFinished,
+  onReviewsPublished,
+  reviewLabel,
   onAuthExpired,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 }: BulkReplyPanelProps) {
@@ -101,6 +125,7 @@ export function BulkReplyPanel({
   const [notice, setNotice] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const notifiedJobs = useRef(new Set<string>())
+  const reportedPublished = useRef(new Set<string>())
   const storageKey = jobStorageKey(locationId)
 
   const loadAutomation = useCallback(() => {
@@ -166,6 +191,17 @@ export function BulkReplyPanel({
     }, pollIntervalMs)
     return () => window.clearTimeout(timer)
   }, [job, pollFailures, pollIntervalMs, storageKey])
+
+  // Report reviews as soon as the job publishes them (not only at the end).
+  useEffect(() => {
+    if (!job || !onReviewsPublished) return
+    const fresh = job.items
+      .filter((item) => item.outcome === 'PUBLISHED' && !reportedPublished.current.has(item.review_id))
+      .map((item) => item.review_id)
+    if (fresh.length === 0) return
+    fresh.forEach((id) => reportedPublished.current.add(id))
+    onReviewsPublished(fresh)
+  }, [job, onReviewsPublished])
 
   // Refresh the review list once per finished job.
   useEffect(() => {
@@ -236,6 +272,32 @@ export function BulkReplyPanel({
     setJob(null)
   }
 
+  const disabledReason = automationError
+    ? 'Could not load the automation settings.'
+    : !automation
+      ? null
+      : !automation.enabled
+        ? 'Automatic replies are disabled on the server (AUTO_REPLY_ENABLED=false).'
+        : null
+  const disabled = !automation || !!disabledReason || pendingCount === 0
+
+  const openConfirm = () => {
+    setStartError(null)
+    setNotice(null)
+    setConfirmOpen(true)
+  }
+
+  const confirmDialog = confirmOpen && automation && (
+    <ConfirmBulkDialog
+      pendingCount={pendingCount}
+      dryRun={automation.dry_run}
+      error={startError}
+      busy={starting}
+      onConfirm={handleStart}
+      onCancel={() => setConfirmOpen(false)}
+    />
+  )
+
   if (job && isActive(job)) {
     return (
       <ProgressCard
@@ -248,16 +310,20 @@ export function BulkReplyPanel({
       />
     )
   }
-  if (job) return <ResultCard job={job} onDismiss={dismissResult} />
-
-  const disabledReason = automationError
-    ? 'Could not load the automation settings.'
-    : !automation
-      ? null
-      : !automation.enabled
-        ? 'Automatic replies are disabled on the server (AUTO_REPLY_ENABLED=false).'
-        : null
-  const disabled = !automation || !!disabledReason || pendingCount === 0
+  if (job) {
+    return (
+      <>
+        <ResultCard
+          job={job}
+          onDismiss={dismissResult}
+          reviewLabel={reviewLabel}
+          pendingCount={pendingCount}
+          onRunAgain={disabled ? undefined : openConfirm}
+        />
+        {confirmDialog}
+      </>
+    )
+  }
 
   return (
     <div className="card flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
@@ -295,25 +361,12 @@ export function BulkReplyPanel({
       <button
         className="btn-primary shrink-0"
         disabled={disabled}
-        onClick={() => {
-          setStartError(null)
-          setNotice(null)
-          setConfirmOpen(true)
-        }}
+        onClick={openConfirm}
       >
         Reply to All Pending Reviews ({pendingCount})
       </button>
 
-      {confirmOpen && automation && (
-        <ConfirmBulkDialog
-          pendingCount={pendingCount}
-          dryRun={automation.dry_run}
-          error={startError}
-          busy={starting}
-          onConfirm={handleStart}
-          onCancel={() => setConfirmOpen(false)}
-        />
-      )}
+      {confirmDialog}
     </div>
   )
 }
@@ -481,9 +534,22 @@ function ProgressCard({
   )
 }
 
-function ResultCard({ job, onDismiss }: { job: BackfillJob; onDismiss: () => void }) {
-  const [showFailed, setShowFailed] = useState(false)
+function ResultCard({
+  job,
+  onDismiss,
+  reviewLabel,
+  pendingCount,
+  onRunAgain,
+}: {
+  job: BackfillJob
+  onDismiss: () => void
+  reviewLabel?: (reviewId: string) => string | undefined
+  pendingCount: number
+  /** Start another bulk reply for the reviews still pending (when allowed). */
+  onRunAgain?: () => void
+}) {
   const failed = job.items.filter((item) => item.outcome === 'FAILED')
+  const skipped = job.items.filter((item) => item.outcome === 'SKIPPED')
   const title =
     job.status === 'COMPLETED'
       ? 'Bulk reply completed'
@@ -520,31 +586,72 @@ function ResultCard({ job, onDismiss }: { job: BackfillJob; onDismiss: () => voi
       )}
       <p className="mt-3 text-sm font-medium text-slate-700">Processed: {job.processed}</p>
       <Counts job={job} />
-      {failed.length > 0 && (
-        <div className="mt-3">
-          <button
-            className="flex items-center gap-1 text-sm font-semibold text-rose-700"
-            onClick={() => setShowFailed((v) => !v)}
-          >
-            {showFailed ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-            {showFailed ? 'Hide' : 'Show'} failed reviews ({failed.length})
+      <ItemList
+        label="failed"
+        tone="text-rose-700"
+        items={failed}
+        reason={failureReason}
+        reviewLabel={reviewLabel}
+      />
+      <ItemList
+        label="skipped"
+        tone="text-slate-700"
+        items={skipped}
+        reason={skipReason}
+        reviewLabel={reviewLabel}
+      />
+      {onRunAgain && pendingCount > 0 && (
+        <div className="mt-4 flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-slate-600">
+            {pendingCount} {pendingCount === 1 ? 'review is' : 'reviews are'} still unanswered.
+          </p>
+          <button className="btn-primary shrink-0" onClick={onRunAgain}>
+            Reply to All Pending Reviews ({pendingCount})
           </button>
-          {showFailed && (
-            <ul className="mt-2 space-y-1.5 text-sm text-slate-600">
-              {failed.map((item) => (
-                <li key={item.review_id}>
-                  <Link
-                    className="font-medium text-brand-600 hover:underline"
-                    to={`/reviews/${encodeURIComponent(item.review_id)}`}
-                  >
-                    Review {shortId(item.review_id)}
-                  </Link>{' '}
-                  — {failureReason(item)}
-                </li>
-              ))}
-            </ul>
-          )}
         </div>
+      )}
+    </div>
+  )
+}
+
+function ItemList({
+  label,
+  tone,
+  items,
+  reason,
+  reviewLabel,
+}: {
+  label: string
+  tone: string
+  items: BackfillItem[]
+  reason: (item: BackfillItem) => string
+  reviewLabel?: (reviewId: string) => string | undefined
+}) {
+  const [open, setOpen] = useState(false)
+  if (items.length === 0) return null
+  return (
+    <div className="mt-3">
+      <button
+        className={classNames('flex items-center gap-1 text-sm font-semibold', tone)}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        {open ? 'Hide' : 'Show'} {label} reviews ({items.length})
+      </button>
+      {open && (
+        <ul className="mt-2 space-y-1.5 text-sm text-slate-600">
+          {items.map((item) => (
+            <li key={item.review_id}>
+              <Link
+                className="font-medium text-brand-600 hover:underline"
+                to={`/reviews/${encodeURIComponent(item.review_id)}`}
+              >
+                {reviewLabel?.(item.review_id) ?? `Review ${shortId(item.review_id)}`}
+              </Link>{' '}
+              — {reason(item)}
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   )

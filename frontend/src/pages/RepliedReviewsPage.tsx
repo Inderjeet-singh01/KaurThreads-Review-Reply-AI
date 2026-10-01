@@ -7,9 +7,9 @@ import { ReviewCard } from '../components/ReviewCard'
 import { ReviewListSkeleton } from '../components/Skeletons'
 import { EmptyState } from '../components/EmptyState'
 import { ErrorState } from '../components/ErrorState'
-import { googleMapsUrl } from '../lib/utils'
+import { googleMapsUrl, timestamp } from '../lib/utils'
 
-type Sort = 'newest' | 'oldest' | 'highest' | 'lowest'
+type Sort = 'recent-reply' | 'oldest-reply' | 'newest' | 'oldest' | 'highest' | 'lowest'
 
 export function RepliedReviewsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
   const { business } = useBusiness()
@@ -17,7 +17,7 @@ export function RepliedReviewsPage({ onAuthExpired }: { onAuthExpired: () => voi
   const navigate = useNavigate()
 
   const [query, setQuery] = useState('')
-  const [sort, setSort] = useState<Sort>('newest')
+  const [sort, setSort] = useState<Sort>('recent-reply')
 
   useEffect(() => {
     if (isAuthError) {
@@ -37,17 +37,20 @@ export function RepliedReviewsPage({ onAuthExpired }: { onAuthExpired: () => voi
         r.review.toLowerCase().includes(q) ||
         (r.reply_comment ?? '').toLowerCase().includes(q),
     )
-    const time = (v: string | null) => (v ? new Date(v).getTime() : 0)
     return [...filtered].sort((a, b) => {
       switch (sort) {
+        case 'recent-reply':
+          return timestamp(b.reply_updated_at) - timestamp(a.reply_updated_at)
+        case 'oldest-reply':
+          return timestamp(a.reply_updated_at) - timestamp(b.reply_updated_at)
         case 'oldest':
-          return time(a.created_at) - time(b.created_at)
+          return timestamp(a.created_at) - timestamp(b.created_at)
         case 'highest':
           return (b.rating ?? 0) - (a.rating ?? 0)
         case 'lowest':
           return (a.rating ?? 0) - (b.rating ?? 0)
         default:
-          return time(b.created_at) - time(a.created_at)
+          return timestamp(b.created_at) - timestamp(a.created_at)
       }
     })
   }, [replied, query, sort])
@@ -83,8 +86,10 @@ export function RepliedReviewsPage({ onAuthExpired }: { onAuthExpired: () => voi
                 onChange={(e) => setSort(e.target.value as Sort)}
                 aria-label="Sort replied reviews"
               >
-                <option value="newest">Newest</option>
-                <option value="oldest">Oldest</option>
+                <option value="recent-reply">Recently replied</option>
+                <option value="oldest-reply">Oldest reply</option>
+                <option value="newest">Newest review</option>
+                <option value="oldest">Oldest review</option>
                 <option value="highest">Highest rating</option>
                 <option value="lowest">Lowest rating</option>
               </select>
@@ -97,7 +102,7 @@ export function RepliedReviewsPage({ onAuthExpired }: { onAuthExpired: () => voi
           <ReviewListSkeleton />
         ) : error ? (
           <div className="p-5">
-            <ErrorState message={error} onRetry={refresh} />
+            <ErrorState message={error} onRetry={() => void refresh()} />
           </div>
         ) : items.length === 0 ? (
           <div className="p-5">

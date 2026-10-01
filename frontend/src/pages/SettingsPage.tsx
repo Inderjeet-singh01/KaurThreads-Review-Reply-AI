@@ -4,12 +4,15 @@ import { Bot, Building2, CheckCircle2, LogOut, RefreshCw, Repeat, XCircle } from
 import { ApiError, api } from '../lib/api'
 import type { AuthStatus, AutomationStatus } from '../lib/types'
 import { useBusiness } from '../context/BusinessContext'
+import { useReviews } from '../context/ReviewsContext'
 import { useToast } from '../context/ToastContext'
 import { Avatar } from '../components/Avatar'
 import { formatFullDate } from '../lib/utils'
 
 export function SettingsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
   const { business, clearBusiness } = useBusiness()
+  // Live counts; the stored business only has a snapshot from when it was picked.
+  const { stats, loading: reviewsLoading, error: reviewsError } = useReviews()
   const toast = useToast()
   const navigate = useNavigate()
 
@@ -164,9 +167,11 @@ export function SettingsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
               {business.address && (
                 <p className="truncate text-xs text-slate-500">{business.address}</p>
               )}
-              <p className="mt-0.5 text-xs text-slate-500">
-                {business.total_reviews} reviews · {business.unanswered} unanswered
-              </p>
+              {!reviewsLoading && !reviewsError && (
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {stats.total_reviews} reviews · {stats.unanswered} unanswered
+                </p>
+              )}
             </div>
             <button
               className="btn-secondary shrink-0"
