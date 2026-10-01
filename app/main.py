@@ -21,6 +21,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+# Hide per-request httpx lines from the AI SDKs; reply_generator logs outcomes.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Startup validation: fail fast when required env vars are missing
@@ -43,7 +45,9 @@ if _missing:
 if not settings.groq_api_key:
     logger.warning("GROQ_API_KEY is not set; replies will be generated with Gemini only")
 if not settings.gemini_api_key:
-    logger.warning("GEMINI_API_KEY is not set; there is no fallback if Groq fails")
+    logger.warning(
+        "GEMINI_API_KEY is not set; no Groq fallback and Check Reply is unavailable"
+    )
 
 app = FastAPI(
     title="Google Review Reply AI",

@@ -8,7 +8,6 @@ Business Profile and never publishes anything.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from google import genai
@@ -16,8 +15,6 @@ from google.genai import types
 
 from app.ai.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 # Single attempt, no SDK-level retries: this is already the fallback path.
 _TIMEOUT_MS = 30_000
@@ -58,7 +55,7 @@ def generate_review_reply_gemini(
     error, rate limit, timeout, blocked or empty response).
     """
     if not settings.gemini_api_key:
-        raise GeminiError("GEMINI_API_KEY is not configured.")
+        raise GeminiError("GEMINI_API_KEY not configured")
 
     user_prompt = build_user_prompt(review, tone=tone, length=length)
 
@@ -88,14 +85,8 @@ def generate_review_reply_gemini(
         )
         reply = (response.text or "").strip()
     except Exception as exc:
-        raise GeminiError(f"Gemini request failed: {_describe(exc)}") from exc
+        raise GeminiError(_describe(exc)) from exc
 
     if not reply:
-        raise GeminiError(f"Gemini returned an empty reply ({_empty_reason(response)}).")
-    logger.info(
-        "Gemini reply generated (model=%s, rating=%s, %d characters)",
-        settings.gemini_model,
-        review.get("rating"),
-        len(reply),
-    )
+        raise GeminiError(f"empty reply ({_empty_reason(response)})")
     return reply

@@ -2,7 +2,8 @@
 
 Handlers are thin: Google operations come from :mod:`app.google.reviews` and
 reply generation from :mod:`app.ai.reply_generator` (Groq primary,
-Gemini fallback).
+Gemini fallback). The manual "Check Reply" validation comes from
+:mod:`app.ai.gemini_validator` and never publishes or regenerates anything.
 
 Publishing is only ever triggered by an explicit call to
 ``POST /reviews/{review_id}/publish`` with the user-approved final text, and
@@ -16,6 +17,11 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.ai.gemini_validator import (
+    GeminiValidationError,
+    GeminiValidationNotConfiguredError,
+    validate_review_reply,
+)
 from app.ai.reply_generator import ReplyGenerationError, generate_review_reply
 from app.auth.google_oauth import GoogleOAuthError
 from app.google.client import GoogleAPIError
@@ -35,8 +41,10 @@ from app.schemas.review import (
     GenerateReplyResponse,
     PublishRequest,
     PublishResult,
+    ReplyValidationResult,
     Review,
     ReviewStats,
+    ValidateReplyRequest,
 )
 
 _LOCATION_QUERY = Query(
@@ -71,6 +79,16 @@ def _to_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, ReplyGenerationError):
         return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, GeminiValidationNotConfiguredError):
+        return HTTPException(
+            status_code=503,
+            detail="Reply checking is not configured (GEMINI_API_KEY is missing).",
+        )
+    if isinstance(exc, GeminiValidationError):
+        return HTTPException(
+            status_code=502,
+            detail="Could not validate the reply right now. Please try again in a moment.",
+        )
     return HTTPException(status_code=500, detail="Unexpected server error")
 
 
@@ -144,17 +162,47 @@ def generate_reply(
         )
 
     review = normalize_review(raw_review)
-    logger.info("Reply generation requested for review %s", review_id)
     try:
         reply = generate_review_reply(review, tone=tone, length=length)
     except ReplyGenerationError as exc:
         raise _to_http_error(exc) from exc
-    logger.info("Reply generated for review %s (not published)", review_id)
     return GenerateReplyResponse(
         review_id=review["review_id"],
         reply=reply,
         review=Review(**review),
     )
+
+
+@router.post("/{review_id}/validate", response_model=ReplyValidationResult)
+def validate_reply(
+    review_id: str,
+    payload: ValidateReplyRequest,
+    location_id: str | None = _LOCATION_QUERY,
+) -> ReplyValidationResult:
+    """Check whether a draft reply is suitable for this review (PASS/FAIL).
+
+    The review is re-fetched from Google (the source of truth); the frontend
+    only supplies the draft text. Cheap deterministic checks run first, then
+    at most one Gemini call. Nothing is published, regenerated, or stored.
+    """
+    try:
+        raw_review = get_review(review_id, location_id=location_id)
+    except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
+        raise _to_http_error(exc) from exc
+
+    if has_reply(raw_review):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This review has already been replied to on Google, so the "
+                "draft was not checked."
+            ),
+        )
+
+    try:
+        return validate_review_reply(normalize_review(raw_review), payload.reply)
+    except GeminiValidationError as exc:
+        raise _to_http_error(exc) from exc
 
 
 @router.post("/{review_id}/publish", response_model=PublishResult)

@@ -7,15 +7,12 @@ and knows nothing about fallback providers (see :mod:`app.ai.reply_generator`).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from groq import Groq
 
 from app.ai.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 # One attempt per request: on failure the orchestrator falls back to Gemini
 # instead of letting the SDK retry (its default is 2 retries with backoff).
@@ -46,7 +43,7 @@ def generate_review_reply_groq(
     rate limit, timeout, or empty response). Never publishes anything.
     """
     if not settings.groq_api_key:
-        raise GroqError("GROQ_API_KEY is not configured.")
+        raise GroqError("GROQ_API_KEY not configured")
 
     user_prompt = build_user_prompt(review, tone=tone, length=length)
 
@@ -67,14 +64,8 @@ def generate_review_reply_groq(
         )
         reply = (response.choices[0].message.content or "").strip()
     except Exception as exc:
-        raise GroqError(f"Groq request failed: {_describe(exc)}") from exc
+        raise GroqError(_describe(exc)) from exc
 
     if not reply:
-        raise GroqError("Groq returned an empty reply.")
-    logger.info(
-        "Groq reply generated (model=%s, rating=%s, %d characters)",
-        settings.groq_model,
-        review.get("rating"),
-        len(reply),
-    )
+        raise GroqError("empty reply")
     return reply

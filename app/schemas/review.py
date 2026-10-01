@@ -1,10 +1,13 @@
 """Pydantic models for the API contract.
 
 Kept minimal: a normalized review, the AI generation response, the publish
-request carrying the user-approved final text, and the publish result.
+request carrying the user-approved final text, the publish result, and the
+manual reply-check (validation) request/result.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -107,3 +110,35 @@ class PublishResult(BaseModel):
     reply: str | None = Field(
         default=None, description="The exact text published to Google."
     )
+
+
+class ValidateReplyRequest(BaseModel):
+    """The draft reply to check via POST /reviews/{review_id}/validate.
+
+    Empty or over-long text is accepted here on purpose: the validator reports
+    it as a FAIL result instead of a request error.
+    """
+
+    reply: str = Field(description="The draft reply text currently shown to the user.")
+
+
+class ValidationChecks(BaseModel):
+    """Individual suitability checks; ``True`` means no clear problem found."""
+
+    review_relevance: bool = Field(description="Reply fits this review and does not contradict it.")
+    business_relevance: bool = Field(description="Reply fits a fashion boutique, not another business.")
+    no_hallucination: bool = Field(description="No invented facts, offers, policies, names, or actions.")
+    appropriate_tone: bool = Field(description="Polite and appropriate for the review's sentiment.")
+    safe_to_publish: bool = Field(description="Nothing that makes the reply unsafe to post publicly.")
+
+
+class ReplyValidationResult(BaseModel):
+    """Result of POST /reviews/{review_id}/validate. Nothing is published."""
+
+    review_id: str
+    passed: bool
+    decision: Literal["PASS", "FAIL"]
+    reason: str | None = Field(
+        default=None, description="Why the reply failed; null when it passed."
+    )
+    checks: ValidationChecks

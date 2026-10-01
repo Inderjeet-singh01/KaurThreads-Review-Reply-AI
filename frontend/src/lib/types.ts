@@ -25,6 +25,22 @@ export interface PublishResult {
   reply: string | null
 }
 
+export interface ReplyValidationChecks {
+  review_relevance: boolean
+  business_relevance: boolean
+  no_hallucination: boolean
+  appropriate_tone: boolean
+  safe_to_publish: boolean
+}
+
+export interface ReplyValidationResult {
+  review_id: string
+  passed: boolean
+  decision: 'PASS' | 'FAIL'
+  reason: string | null
+  checks: ReplyValidationChecks
+}
+
 export interface LocationSummary {
   location_id: string
   name: string

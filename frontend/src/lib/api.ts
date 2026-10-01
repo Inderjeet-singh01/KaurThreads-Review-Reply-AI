@@ -9,6 +9,7 @@ import type {
   GenerateReplyResponse,
   LocationSummary,
   PublishResult,
+  ReplyValidationResult,
   Review,
   ReviewStats,
 } from './types'
@@ -126,6 +127,16 @@ export const api = {
       { method: 'POST' },
     )
   },
+
+  validateReply: (
+    reviewId: string,
+    reply: string,
+    locationId?: string | null,
+  ) =>
+    request<ReplyValidationResult>(
+      withLocation(`/reviews/${encodeURIComponent(reviewId)}/validate`, locationId),
+      { method: 'POST', body: JSON.stringify({ reply }) },
+    ),
 
   publishReply: (
     reviewId: string,

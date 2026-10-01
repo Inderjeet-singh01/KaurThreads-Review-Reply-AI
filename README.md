@@ -85,7 +85,7 @@ google-review-reply/
 │   ├── main.py                  # FastAPI app, routers, health endpoint
 │   ├── config.py                # env-based settings, token file path
 │   ├── api/
-│   │   └── reviews.py           # GET /reviews, POST .../generate, POST .../publish
+│   │   └── reviews.py           # GET /reviews, POST .../generate, .../validate, .../publish
 │   ├── auth/
 │   │   └── google_oauth.py      # OAuth 2.0 only (authorize, callback, token file) + auth endpoints
 │   ├── google/
@@ -95,7 +95,8 @@ google-review-reply/
 │   │   ├── prompts.py           # shared reply-generation prompt (single source of truth)
 │   │   ├── groq_client.py       # Groq integration (primary provider)
 │   │   ├── gemini_client.py     # Gemini integration (fallback provider)
-│   │   └── reply_generator.py   # Groq → Gemini fallback orchestration
+│   │   ├── reply_generator.py   # Groq → Gemini fallback orchestration
+│   │   └── gemini_validator.py  # manual "Check Reply" validation (PASS/FAIL)
 │   └── schemas/
 │       └── review.py            # Pydantic API contracts
 ├── credentials/                 # gitignored; google_token.json created after first OAuth
@@ -149,7 +150,7 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_CLIENT_SECRET` | yes | OAuth client secret. |
 | `GOOGLE_REDIRECT_URI` | yes | Must match the redirect URI registered with the OAuth client. Default `http://localhost:8000/auth/google/callback`. |
 | `GROQ_API_KEY` | yes* | Groq API key from <https://console.groq.com/keys> (primary provider). |
-| `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (automatic fallback). |
+| `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (automatic generation fallback + Check Reply validation). |
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
 | `GROQ_MODEL` | no | Groq model for generation. Default `llama-3.3-70b-versatile`. |
 | `GEMINI_MODEL` | no | Gemini model for fallback generation. Default `gemini-3.8-flash`. |
@@ -258,6 +259,51 @@ POST /reviews/{review_id}/generate
 ```
 
 Returns `409` if the review already has a business reply.
+
+### Check a draft reply (manual validation — nothing is published)
+
+```
+POST /reviews/{review_id}/validate?location_id=...   (location_id optional)
+{ "reply": "Draft reply currently shown to the user" }
+```
+
+Triggered only by the **Check Reply** button on the review page. It answers
+"is this draft *clearly* unsuitable or unsafe to publish?" — it is a lenient,
+high-confidence check, not a writing-quality score, so a natural or slightly
+generic boutique reply should pass. It is for observing validator behaviour;
+**Post Reply does not require a PASS**, and nothing is regenerated or
+published automatically.
+
+The backend re-fetches the review from Google (the frontend only sends the
+draft), then:
+
+1. `409` if the review already has a business reply (Gemini is not called).
+2. Cheap deterministic checks — empty text, over Google's 4096-byte limit,
+   broken characters, unfilled placeholders like `[Customer Name]`, obvious
+   AI/prompt disclosure ("As an AI…"). A problem here returns `FAIL` without
+   calling Gemini.
+3. Otherwise exactly **one** Gemini call (`GEMINI_MODEL`, default
+   `gemini-3.8-flash`, no retries) returns the structured verdict.
+
+```json
+{
+  "review_id": "AIe9_BFu3rdicGrPrzdyu4...",
+  "passed": false,
+  "decision": "FAIL",
+  "reason": "The reply refers to a restaurant meal, not a fashion boutique.",
+  "checks": {
+    "review_relevance": false,
+    "business_relevance": false,
+    "no_hallucination": true,
+    "appropriate_tone": true,
+    "safe_to_publish": false
+  }
+}
+```
+
+On `PASS`, `passed` is `true`, `reason` is `null` and every check is `true`.
+Requires `GEMINI_API_KEY`; without it the endpoint returns `503` (the app
+still starts). A Gemini failure returns `502` with a user-safe message.
 
 ### Publish the user-approved final reply
 
