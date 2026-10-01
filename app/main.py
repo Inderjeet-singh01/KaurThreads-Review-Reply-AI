@@ -29,22 +29,30 @@ _REQUIRED_SETTINGS = {
     "GOOGLE_CLIENT_ID": settings.google_client_id,
     "GOOGLE_CLIENT_SECRET": settings.google_client_secret,
     "GOOGLE_REDIRECT_URI": settings.google_redirect_uri,
-    "GROQ_API_KEY": settings.groq_api_key,
 }
 _missing = [name for name, value in _REQUIRED_SETTINGS.items() if not value]
+# Each AI provider is optional on its own (Gemini is the fallback for Groq),
+# but at least one must be configured for reply generation to work.
+if not settings.groq_api_key and not settings.gemini_api_key:
+    _missing.append("GROQ_API_KEY or GEMINI_API_KEY")
 if _missing:
     raise RuntimeError(
         "Missing required environment variables: "
         f"{', '.join(_missing)}. Set them in the .env file and restart."
     )
+if not settings.groq_api_key:
+    logger.warning("GROQ_API_KEY is not set; replies will be generated with Gemini only")
+if not settings.gemini_api_key:
+    logger.warning("GEMINI_API_KEY is not set; there is no fallback if Groq fails")
 
 app = FastAPI(
     title="Google Review Reply AI",
     version="1.0.0",
     description=(
         "Phase 1: fetch unanswered Google Business Profile reviews for a "
-        "boutique, generate professional replies with Groq, and publish them "
-        "only after explicit user approval plus a final reply check on "
+        "boutique, generate professional replies with Groq (Gemini "
+        "fallback), and publish them only after explicit user approval "
+        "plus a final reply check on "
         "Google. Generated replies are NEVER published automatically."
     ),
 )

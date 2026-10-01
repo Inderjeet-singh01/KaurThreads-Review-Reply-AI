@@ -10,6 +10,9 @@ requests>=2.31
 # Groq API (AI reply generation)
 groq>=0.13
 
+# Google Gemini API (automatic fallback for reply generation)
+google-genai>=1.50
+
 # API contracts / configuration
 pydantic>=2.7
 pydantic-settings>=2.3

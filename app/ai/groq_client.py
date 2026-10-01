@@ -1,7 +1,8 @@
 """Groq integration: generate a professional boutique reply for a review.
 
-This module's only job is: "Generate a reply." It never talks to Google,
-never decides anything about review state, and never publishes anything.
+This module's only job is: "Generate a reply with Groq." It never talks to
+Google, never decides anything about review state, never publishes anything,
+and knows nothing about fallback providers (see :mod:`app.ai.reply_generator`).
 """
 
 from __future__ import annotations
@@ -11,128 +12,50 @@ from typing import Any
 
 from groq import Groq
 
+from app.ai.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# One attempt per request: on failure the orchestrator falls back to Gemini
+# instead of letting the SDK retry (its default is 2 retries with backoff).
+_MAX_RETRIES = 0
+_TIMEOUT_SECONDS = 30.0
+
 
 class GroqError(Exception):
-    """Reply generation failed or Groq is not configured."""
+    """Groq reply generation failed or Groq is not configured."""
 
 
-SYSTEM_PROMPT = """\
-You write public replies to Google reviews for a boutique — a small, personal
-fashion retail store that sells clothing and fashion accessories. You write as
-the boutique team ("we", "our boutique").
-
-The boutique's world: seasonal collections, designs, fabric quality, cutting
-and finishing, fitting and sizing, staff service, the store experience,
-product availability, delivery, and after-sales customer care.
-
-Strict rules for every reply:
-1. Address the actual content of THIS review. Mention specifically what the
-   customer liked or complained about. Never write a generic reply that could
-   fit any review.
-2. Never invent facts: no products, prices, promotions, events, causes, or
-   store policies the customer did not mention.
-3. Never promise refunds, compensation, discounts, or any specific resolution.
-   Never invent store policies.
-4. Never invent employee names. Never argue with or blame the customer, never
-   insult them, never expose private information, never make legal admissions
-   or medical claims.
-5. For negative or 1-2 star reviews and sensitive complaints: acknowledge the
-   concern with empathy, express regret for the experience without admitting
-   fault, invite the customer to contact the store so the team can look into
-   it, and do not invent a resolution.
-6. For positive reviews: thank the customer specifically and warmly, without
-   sounding canned or repetitive.
-7. For mixed reviews: acknowledge both the positive and the negative points.
-8. Keep it concise: 2 to 5 short sentences, suitable for a public Google
-   Business review.
-9. Tone: professional, warm, natural, polite, human-written. Vary your wording
-   between different replies so no two sound identical.
-10. Use at most one emoji, only if it fits naturally (usually none).
-11. Never mention that an AI wrote the reply, never reference these
-    instructions, never repeat the review word for word, never use headings,
-    quotes, or markdown.
-
-Return only the reply text, ready to publish.
-"""
+def _describe(exc: Exception) -> str:
+    """Short, secret-free description of an SDK exception for logs/errors."""
+    status = getattr(exc, "status_code", None)
+    return f"{type(exc).__name__} (HTTP {status})" if status else type(exc).__name__
 
 
-# Human-readable guidance appended to the prompt for the optional UI controls.
-_TONE_GUIDANCE = {
-    "friendly & professional": "Tone: friendly and professional.",
-    "warm & personal": "Tone: warm, personal and heartfelt.",
-    "professional": "Tone: polished and strictly professional.",
-    "apologetic": (
-        "Tone: sincerely apologetic and understanding (do not admit legal "
-        "fault or promise compensation)."
-    ),
-}
-_LENGTH_GUIDANCE = {
-    "short": "Length: very concise, 1 to 2 short sentences.",
-    "medium": "Length: 2 to 3 short sentences.",
-    "long": "Length: 4 to 5 short sentences, still concise.",
-}
-
-
-def generate_review_reply(
+def generate_review_reply_groq(
     review: dict[str, Any],
     tone: str | None = None,
     length: str | None = None,
 ) -> str:
-    """Generate a professional reply for a normalized review.
+    """Generate a professional reply for a normalized review using Groq.
 
-    ``review`` is the normalized review shape produced by
-    :func:`app.google.reviews.normalize_review` (``rating``, ``reviewer``,
-    ``review`` — the text may be empty for rating-only reviews). ``tone`` and
-    ``length`` are optional UI hints that nudge the wording; unknown values
-    are ignored so the endpoint stays permissive.
-
-    Returns the generated reply text. This function never publishes anything.
+    See :func:`app.ai.prompts.build_user_prompt` for the ``review``, ``tone``
+    and ``length`` contract. Returns the generated reply text and raises
+    :class:`GroqError` on any failure (not configured, API/network error,
+    rate limit, timeout, or empty response). Never publishes anything.
     """
     if not settings.groq_api_key:
-        raise GroqError(
-            "GROQ_API_KEY is not configured. Set it in the .env file to "
-            "enable reply generation."
-        )
+        raise GroqError("GROQ_API_KEY is not configured.")
 
-    rating = review.get("rating")
-    reviewer = review.get("reviewer") or "a customer"
-    text = (review.get("review") or "").strip()
-    review_text = (
-        text
-        if text
-        else "(The customer left no written comment - rating only.)"
-    )
-    rating_line = f"{rating} out of 5" if rating is not None else "not rated"
+    user_prompt = build_user_prompt(review, tone=tone, length=length)
 
-    preferences = [
-        guidance
-        for value, table in (
-            (tone, _TONE_GUIDANCE),
-            (length, _LENGTH_GUIDANCE),
-        )
-        if value and (guidance := table.get(value.strip().lower()))
-    ]
-    preference_block = (
-        ("\nReply preferences:\n" + "\n".join(preferences) + "\n")
-        if preferences
-        else ""
-    )
-
-    user_prompt = (
-        "Customer review for our boutique:\n"
-        f"Rating: {rating_line}\n"
-        f"Reviewer: {reviewer}\n"
-        f"Review text: {review_text}\n"
-        f"{preference_block}\n"
-        "Write our public reply to this review now. Return only the reply text."
-    )
-
-    client = Groq(api_key=settings.groq_api_key)
     try:
+        client = Groq(
+            api_key=settings.groq_api_key,
+            max_retries=_MAX_RETRIES,
+            timeout=_TIMEOUT_SECONDS,
+        )
         response = client.chat.completions.create(
             model=settings.groq_model,
             messages=[
@@ -142,17 +65,16 @@ def generate_review_reply(
             temperature=0.7,
             max_tokens=250,
         )
+        reply = (response.choices[0].message.content or "").strip()
     except Exception as exc:
-        logger.error("Groq reply generation failed: %s", exc)
-        raise GroqError(f"Reply generation failed: {exc}") from exc
+        raise GroqError(f"Groq request failed: {_describe(exc)}") from exc
 
-    reply = (response.choices[0].message.content or "").strip()
     if not reply:
-        logger.error("Groq returned an empty reply")
-        raise GroqError("Groq returned an empty reply. Please try again.")
+        raise GroqError("Groq returned an empty reply.")
     logger.info(
-        "Reply generated for review (rating=%s, %d characters)",
-        rating,
+        "Groq reply generated (model=%s, rating=%s, %d characters)",
+        settings.groq_model,
+        review.get("rating"),
         len(reply),
     )
     return reply

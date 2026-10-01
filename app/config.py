@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
 
+    # --- Gemini (automatic fallback when Groq generation fails) ------------
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.8-flash"
+
     # --- Frontend / CORS --------------------------------------------------
     # Comma-separated list of browser origins allowed to call this API.
     # Defaults cover the local Vite dev server. Set CORS_ALLOW_ORIGINS in

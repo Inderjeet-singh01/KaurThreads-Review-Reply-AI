@@ -1,7 +1,8 @@
 """API endpoints for reviews, reply generation, and publishing.
 
 Handlers are thin: Google operations come from :mod:`app.google.reviews` and
-reply generation from :mod:`app.ai.groq_client`.
+reply generation from :mod:`app.ai.reply_generator` (Groq primary,
+Gemini fallback).
 
 Publishing is only ever triggered by an explicit call to
 ``POST /reviews/{review_id}/publish`` with the user-approved final text, and
@@ -15,7 +16,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.ai.groq_client import GroqError, generate_review_reply
+from app.ai.reply_generator import ReplyGenerationError, generate_review_reply
 from app.auth.google_oauth import GoogleOAuthError
 from app.google.client import GoogleAPIError
 from app.google.reviews import (
@@ -68,7 +69,7 @@ def _to_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, GoogleReviewError):
         return HTTPException(status_code=502, detail=str(exc))
-    if isinstance(exc, GroqError):
+    if isinstance(exc, ReplyGenerationError):
         return HTTPException(status_code=502, detail=str(exc))
     return HTTPException(status_code=500, detail="Unexpected server error")
 
@@ -146,7 +147,7 @@ def generate_reply(
     logger.info("Reply generation requested for review %s", review_id)
     try:
         reply = generate_review_reply(review, tone=tone, length=length)
-    except GroqError as exc:
+    except ReplyGenerationError as exc:
         raise _to_http_error(exc) from exc
     logger.info("Reply generated for review %s (not published)", review_id)
     return GenerateReplyResponse(

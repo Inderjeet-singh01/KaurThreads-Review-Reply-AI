@@ -10,7 +10,8 @@ A FastAPI application for a **boutique business** that:
 1. Authenticates the owner with **Google OAuth 2.0** (Business Profile management scope).
 2. Finds the boutique's Business Profile location through the Google Business Profile APIs.
 3. Fetches Google reviews and returns **only the ones without a business reply**.
-4. Generates a professional, boutique-appropriate reply with the **Groq API**.
+4. Generates a professional, boutique-appropriate reply with the **Groq API**, falling
+   back automatically to the **Google Gemini API** if Groq fails.
 5. Lets the user **edit** the reply and **publish it only after explicit approval** — with a **final reply check on Google** right before publishing.
 
 > **Safety rule:** the application may *generate* a reply automatically, but it can
@@ -41,7 +42,7 @@ GET /reviews                    (unanswered reviews only)
 User selects a review
         │
         ▼
-app/ai/groq_client.py           (boutique-specific reply generation)
+app/ai/reply_generator.py       (Groq primary → Gemini fallback, shared prompt)
         │
         ▼
 Generated reply draft           (NOT published)
@@ -91,7 +92,10 @@ google-review-reply/
 │   │   ├── client.py            # authenticated Business Profile REST client
 │   │   └── reviews.py           # review fetching/filtering/final check/publish
 │   ├── ai/
-│   │   └── groq_client.py       # Groq integration (generate a reply, nothing else)
+│   │   ├── prompts.py           # shared reply-generation prompt (single source of truth)
+│   │   ├── groq_client.py       # Groq integration (primary provider)
+│   │   ├── gemini_client.py     # Gemini integration (fallback provider)
+│   │   └── reply_generator.py   # Groq → Gemini fallback orchestration
 │   └── schemas/
 │       └── review.py            # Pydantic API contracts
 ├── credentials/                 # gitignored; google_token.json created after first OAuth
@@ -144,9 +148,14 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_CLIENT_ID` | yes | OAuth client ID (Web application). |
 | `GOOGLE_CLIENT_SECRET` | yes | OAuth client secret. |
 | `GOOGLE_REDIRECT_URI` | yes | Must match the redirect URI registered with the OAuth client. Default `http://localhost:8000/auth/google/callback`. |
-| `GROQ_API_KEY` | yes | Groq API key from <https://console.groq.com/keys>. |
+| `GROQ_API_KEY` | yes* | Groq API key from <https://console.groq.com/keys> (primary provider). |
+| `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (automatic fallback). |
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
 | `GROQ_MODEL` | no | Groq model for generation. Default `llama-3.3-70b-versatile`. |
+| `GEMINI_MODEL` | no | Gemini model for fallback generation. Default `gemini-3.8-flash`. |
+
+\* At least one of `GROQ_API_KEY` / `GEMINI_API_KEY` is required; set both for
+automatic fallback.
 
 The Google OAuth token is **not** an environment variable. After the first
 successful OAuth flow it is written to `credentials/google_token.json`
@@ -158,6 +167,18 @@ successful OAuth flow it is written to `credentials/google_token.json`
 2. Put the key in `GROQ_API_KEY` in `.env`.
 3. (Optional) change `GROQ_MODEL` — any chat model available to your key works
    (default: `llama-3.3-70b-versatile`).
+
+### Gemini fallback
+
+If Groq fails for any reason (missing key, API error, rate limit / HTTP 429,
+timeout, empty reply), the same request is sent **once** to Gemini with the
+exact same prompt and rules. Gemini is never called when Groq succeeds. If
+Gemini also fails (or `GEMINI_API_KEY` is empty), the generate endpoint returns
+a clean `502`.
+
+1. Create an API key at <https://aistudio.google.com/apikey>.
+2. Put it in `GEMINI_API_KEY` in `.env`.
+3. (Optional) change `GEMINI_MODEL` (default: `gemini-3.8-flash`).
 
 ## 6. Local installation
 
