@@ -177,10 +177,34 @@ _LENGTH_GUIDANCE = {
 }
 
 
+# Upper bound on validator feedback quoted into a regeneration prompt.
+_MAX_REVISION_FEEDBACK_CHARS = 300
+
+
+def _revision_block(revision_feedback: str | None) -> str:
+    """Correction note for a regeneration after a failed suitability check.
+
+    Empty when there is no feedback, so normal prompts are byte-for-byte
+    unchanged. The feedback is quoted as data: it guides the correction but
+    never overrides :data:`SYSTEM_PROMPT`.
+    """
+    feedback = " ".join((revision_feedback or "").split())[:_MAX_REVISION_FEEDBACK_CHARS]
+    if not feedback:
+        return ""
+    return (
+        "\nThe previous draft failed a suitability check for this reason:\n"
+        f"<<<\n{feedback}\n>>>\n"
+        "Generate a corrected reply that fixes this issue while still following "
+        "all existing reply-generation rules. Do not mention the check, the "
+        "previous draft or this note in the reply.\n"
+    )
+
+
 def build_user_prompt(
     review: dict[str, Any],
     tone: str | None = None,
     length: str | None = None,
+    revision_feedback: str | None = None,
 ) -> str:
     """Build the per-review user prompt sent alongside :data:`SYSTEM_PROMPT`.
 
@@ -188,7 +212,8 @@ def build_user_prompt(
     :func:`app.google.reviews.normalize_review` (``rating``, ``reviewer``,
     ``review`` — the text may be empty for rating-only reviews). ``tone`` and
     ``length`` are optional UI hints that nudge the wording; unknown values
-    are ignored so the endpoint stays permissive.
+    are ignored so the endpoint stays permissive. ``revision_feedback`` is the
+    reason a previous draft failed validation (automatic regeneration only).
     """
     rating = review.get("rating")
     reviewer = review.get("reviewer") or "a customer"
@@ -219,6 +244,7 @@ def build_user_prompt(
         f"Rating: {rating_line}\n"
         f"Reviewer: {reviewer}\n"
         f"Review text: {review_text}\n"
-        f"{preference_block}\n"
+        f"{preference_block}"
+        f"{_revision_block(revision_feedback)}\n"
         "Write our public reply to this review now. Return only the reply text."
     )

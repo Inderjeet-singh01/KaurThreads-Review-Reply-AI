@@ -169,16 +169,34 @@ def save_credentials(credentials: Credentials) -> None:
         pass
 
 
+def _persist_refreshed(credentials: Credentials) -> None:
+    """Best-effort save after a refresh.
+
+    The refresh token is unchanged by a refresh, so a read-only token file
+    (e.g. a Render Secret File) keeps working: the new access token simply
+    lives in memory and is refreshed again when needed.
+    """
+    try:
+        save_credentials(credentials)
+    except OSError as exc:
+        logger.warning(
+            "Refreshed Google access token could not be written to %s (%s); "
+            "continuing with the in-memory token",
+            GOOGLE_TOKEN_FILE, type(exc).__name__,
+        )
+
+
 def refresh_credentials_if_needed(credentials: Credentials) -> None:
     """Refresh an expired access token when a refresh token is available.
 
-    The refreshed token is persisted so the next process start benefits from
-    it. Raises the underlying refresh error when refreshing fails.
+    The refreshed token is persisted (best effort) so the next process start
+    benefits from it. Raises the underlying refresh error when refreshing
+    fails.
     """
     if credentials.expired and credentials.refresh_token:
         logger.info("Google access token expired; refreshing it")
         credentials.refresh(Request())
-        save_credentials(credentials)
+        _persist_refreshed(credentials)
 
 
 def force_refresh_credentials(credentials: Credentials) -> bool:
@@ -190,7 +208,7 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
         return False
     try:
         credentials.refresh(Request())
-        save_credentials(credentials)
+        _persist_refreshed(credentials)
         logger.info("Google access token force-refreshed")
         return True
     except Exception as exc:

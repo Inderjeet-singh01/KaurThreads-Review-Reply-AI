@@ -34,6 +34,7 @@ def generate_review_reply_groq(
     review: dict[str, Any],
     tone: str | None = None,
     length: str | None = None,
+    revision_feedback: str | None = None,
 ) -> str:
     """Generate a professional reply for a normalized review using Groq.
 
@@ -45,7 +46,9 @@ def generate_review_reply_groq(
     if not settings.groq_api_key:
         raise GroqError("GROQ_API_KEY not configured")
 
-    user_prompt = build_user_prompt(review, tone=tone, length=length)
+    user_prompt = build_user_prompt(
+        review, tone=tone, length=length, revision_feedback=revision_feedback
+    )
 
     try:
         client = Groq(

@@ -14,10 +14,14 @@ A FastAPI application for a **boutique business** that:
    back automatically to the **Google Gemini API** if Groq fails.
 5. Lets the user **edit** the reply and **publish it only after explicit approval** — with a **final reply check on Google** right before publishing.
 
-> **Safety rule:** the application may *generate* a reply automatically, but it can
-> **never publish automatically**. Publishing happens only when the user explicitly
-> calls the publish endpoint with the final approved text, and only if the review
-> still has no business reply on Google at that moment.
+> **Safety rule:** in the manual workflow, publishing happens only when the user
+> explicitly calls the publish endpoint with the final approved text, and only if
+> the review still has no business reply on Google at that moment.
+>
+> **Optional automation:** new reviews can also be answered automatically
+> (Pub/Sub webhook → generate → validate → final Google check → publish). It is
+> **off by default** (`AUTO_REPLY_ENABLED=false`) and has a dry-run mode. See
+> [section 13](#13-automatic-review-reply-automation).
 
 ---
 
@@ -85,7 +89,13 @@ google-review-reply/
 │   ├── main.py                  # FastAPI app, routers, health endpoint
 │   ├── config.py                # env-based settings, token file path
 │   ├── api/
-│   │   └── reviews.py           # GET /reviews, POST .../generate, .../validate, .../publish
+│   │   ├── reviews.py           # GET /reviews, POST .../generate, .../validate, .../publish
+│   │   └── automation.py        # GET /automation/status, dev-only POST /automation/test/{id}
+│   ├── automation/
+│   │   └── processor.py         # automatic workflow: process_new_review()
+│   ├── webhooks/
+│   │   ├── google_reviews.py    # POST /webhooks/google-reviews (Pub/Sub push)
+│   │   └── pubsub.py            # push JWT verification + notification decoding
 │   ├── auth/
 │   │   └── google_oauth.py      # OAuth 2.0 only (authorize, callback, token file) + auth endpoints
 │   ├── google/
@@ -154,6 +164,14 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
 | `GROQ_MODEL` | no | Groq model for generation. Default `llama-3.3-70b-versatile`. |
 | `GEMINI_MODEL` | no | Gemini model for fallback generation. Default `gemini-3.8-flash`. |
+| `GOOGLE_TOKEN_FILE` | no | Absolute path of the OAuth token file. Default `credentials/google_token.json`. Required on Render for automation (section 13.6). |
+| `AUTO_REPLY_ENABLED` | no | `true` enables automatic replies to new reviews. Default **`false`**. |
+| `AUTO_REPLY_DRY_RUN` | no | `true` runs the full automatic pipeline without publishing (`WOULD_PUBLISH` log). Default `false`. |
+| `AUTO_REPLY_MAX_REGENERATIONS` | no | Regenerations after a failed validation: `0` or `1` (hard maximum). Default `1`. |
+| `AUTO_REPLY_LOCATION_IDS` | no | Comma-separated location ids to automate. Empty = every location of the notifying account. |
+| `PUBSUB_PUSH_AUDIENCE` | for automation | Expected `aud` of the Pub/Sub push JWT. |
+| `PUBSUB_PUSH_SERVICE_ACCOUNT` | for automation | Expected `email` of the Pub/Sub push JWT. |
+| `AUTOMATION_TEST_ENDPOINT_ENABLED` | no | Development only: exposes `POST /automation/test/{review_id}`. Default `false`. |
 
 \* At least one of `GROQ_API_KEY` / `GEMINI_API_KEY` is required; set both for
 automatic fallback.
@@ -334,9 +352,13 @@ GET /auth/google/callback    # OAuth redirect target (code + state)
 
 ## 10. Safety and approval behavior
 
-- **No automatic publishing.** There is no code path from review → Groq →
-  Google. Only an explicit `POST /reviews/{review_id}/publish` publishes, and
-  only with user-supplied final text.
+- **Manual publishing needs explicit approval.** In the manual workflow only
+  an explicit `POST /reviews/{review_id}/publish` publishes, and only with
+  user-supplied final text.
+- **Automatic publishing is opt-in.** The only automatic code path is the
+  Pub/Sub webhook (section 13). It does nothing unless
+  `AUTO_REPLY_ENABLED=true`, never publishes in `AUTO_REPLY_DRY_RUN=true`, and
+  publishes only a reply that passed validation and a final Google check.
 - **Final check before publish.** The review is re-fetched from Google
   immediately before publishing; a reply added by anyone in the meantime
   blocks the publish with `409`.
@@ -354,6 +376,9 @@ GET /auth/google/callback    # OAuth redirect target (code + state)
 - **Concurrency caveat (Phase 1):** two simultaneous publish requests for the
   same review could both pass the final check; the second `updateReply` would
   replace the first. This tool is single-user by design; serialize publishing.
+  The same applies to a manual publish racing an automatic one: the automatic
+  run checks Google immediately before publishing, but a reply posted between
+  that check and the publish call can be replaced.
 
 ## 11. Security notes
 
@@ -381,3 +406,280 @@ GET /auth/google/callback    # OAuth redirect target (code + state)
   `mybusiness.googleapis.com/v4` endpoint (Google has not migrated reviews to
   v1); this app calls exactly the documented v4 methods
   (`list`, `get`, `updateReply`).
+
+## 13. Automatic Review Reply Automation
+
+New reviews can be answered automatically, in addition to (never instead of)
+the manual workflow. Everything in the manual workflow keeps working
+unchanged: Generate Reply, Check Reply, Edit Manually and Post Reply.
+
+> **Status:** the code path is unit-tested with mocked Google/AI services. It
+> is **not production-verified** until the Google Cloud configuration below
+> is done, the deployed OAuth token is durable, and a dry run has been
+> observed with a real new review.
+
+### 13.1 Flow
+
+```
+New Google review
+  → Business Profile notification (NEW_REVIEW)
+  → Cloud Pub/Sub topic
+  → authenticated HTTPS push → POST /webhooks/google-reviews
+  → verify Pub/Sub JWT (signature, issuer, audience, service account, expiry)
+  → decode notification → review resource name (the event is only a trigger)
+  → AUTO_REPLY_ENABLED? no → DISABLED (acknowledged, nothing else happens)
+  → fetch the review from Google (source of truth)
+  → already replied? yes → SKIPPED_ALREADY_REPLIED (no AI call)
+  → generate: Groq; Gemini only if Groq fails
+  → validate: same validate_review_reply() as Check Reply
+       (deterministic checks first, then one AI verdict)
+  → FAIL? regenerate ONCE with the failure reason → validate again
+       → FAIL again → FAILED_VALIDATION (stop; reply manually)
+  → final Google check: replied meanwhile? → SKIPPED_ALREADY_REPLIED
+  → AUTO_REPLY_DRY_RUN? yes → DRY_RUN (logs WOULD_PUBLISH + the reply)
+  → publish_reply() (same function as Post Reply) → PUBLISHED
+```
+
+A reply is published only when **all** of these hold: `AUTO_REPLY_ENABLED`
+is true, dry run is off, the review was unanswered, generation succeeded, the
+deterministic checks and the AI verdict both passed (for the regenerated
+reply too, when regeneration was needed), and the final Google check found no
+business reply.
+
+**AI call budget per review:** normally 1 generation + 1 validation. At most
+2 generations (+1 Gemini fallback each) and 2 validations (+1 Gemini
+fallback each). Never a third generation. A validator *outage* (timeout,
+quota, malformed provider answer) is **not** a FAIL verdict: the run stops as
+a retryable `ERROR` without regenerating.
+
+Note: the existing validator (`app/ai/reply_validator.py`) asks **Groq
+first and Gemini only if Groq fails** — the same order as generation. The
+automation reuses it unchanged.
+
+### 13.2 Pub/Sub acknowledgement semantics
+
+| Outcome | HTTP | Pub/Sub |
+| --- | --- | --- |
+| `PUBLISHED`, `DRY_RUN`, `SKIPPED_ALREADY_REPLIED`, `FAILED_VALIDATION`, `DISABLED`, `IGNORED` (other notification types / location not allowlisted), `SKIPPED_NOT_FOUND`, recently-finished `DUPLICATE` | 200 | acknowledged |
+| Same review already being processed (`DUPLICATE`) | 409 | redelivered later |
+| Transient Google/AI failure (`ERROR`, `FAILED_GENERATION`) | 503 | redelivered |
+| Undecodable message | 400 | redelivered → dead-letter topic |
+| Missing / invalid JWT | 401 / 403 | redelivered (fix the configuration) |
+
+Retries are bounded twice: the subscription's dead-letter policy (below), and
+in the app, which acknowledges a review after **3** retryable failures and
+logs "manual review needed".
+
+### 13.3 Duplicate handling
+
+Pub/Sub can deliver a message more than once. Inside the process:
+
+1. a per-review `asyncio.Lock`: a second delivery while the review is being
+   processed gets `409` and is retried later;
+2. an outcome memory (24 h): a redelivery after `FAILED_VALIDATION`,
+   `DRY_RUN` or an exhausted retry budget is acknowledged without new AI calls;
+3. the **mandatory** Google check: a redelivery after `PUBLISHED` fetches the
+   review, sees the reply and stops; the final check before publishing
+   catches replies made by anyone while the AI was working.
+
+**Run the backend as one process.** The lock and memory live in memory.
+Use a single Render instance and a single uvicorn worker (the default:
+`uvicorn app.main:app --host 0.0.0.0 --port $PORT`, no `--workers N`, no
+multi-worker gunicorn). With several workers or instances, the Google checks
+still prevent most duplicates, but two processes could both pass the final
+check at the same moment. That needs a shared lock (e.g. Redis or Postgres)
+before you scale out. A restart clears the memory (the Google checks still
+apply).
+
+### 13.4 Google Cloud configuration (done in Google Cloud / Business Profile)
+
+Verified against Google's current documentation: the **My Business
+Notifications API v1** (`mybusinessnotifications.googleapis.com`,
+resource `accounts/{accountId}/notificationSetting`, notification type
+`NEW_REVIEW`) — not the old v4 `updateNotifications` method — plus Cloud
+Pub/Sub authenticated push.
+
+Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
+
+1. **Google Cloud project**: use the project that holds the OAuth client and
+   has approved Business Profile API access (section 3).
+2. **Enable the APIs**:
+   ```bash
+   gcloud services enable pubsub.googleapis.com \
+     mybusinessnotifications.googleapis.com --project=PROJECT_ID
+   ```
+   (The Business Profile, Account Management and Business Information APIs
+   from section 3 must also be enabled.)
+3. **Pub/Sub topic**, and let Business Profile publish to it:
+   ```bash
+   gcloud pubsub topics create gbp-reviews --project=PROJECT_ID
+   gcloud pubsub topics add-iam-policy-binding gbp-reviews --project=PROJECT_ID \
+     --member=serviceAccount:mybusiness-api-pubsub@system.gserviceaccount.com \
+     --role=roles/pubsub.publisher
+   ```
+4. **Push-auth service account** (Pub/Sub signs the push JWT as this account):
+   ```bash
+   gcloud iam service-accounts create gbp-reviews-push --project=PROJECT_ID \
+     --display-name="GBP reviews push auth"
+   # Pub/Sub service agent may mint tokens for it (granted by default only on
+   # projects created after 2021-04-08; harmless to add):
+   gcloud iam service-accounts add-iam-policy-binding \
+     gbp-reviews-push@PROJECT_ID.iam.gserviceaccount.com \
+     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+     --role=roles/iam.serviceAccountTokenCreator
+   ```
+   Whoever creates the subscription needs `iam.serviceAccounts.actAs` on that
+   account (e.g. `roles/iam.serviceAccountUser`).
+5. **Dead-letter topic** (collects messages that keep failing):
+   ```bash
+   gcloud pubsub topics create gbp-reviews-dead-letter --project=PROJECT_ID
+   gcloud pubsub topics add-iam-policy-binding gbp-reviews-dead-letter --project=PROJECT_ID \
+     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+     --role=roles/pubsub.publisher
+   ```
+6. **Authenticated push subscription** to the Render HTTPS URL:
+   ```bash
+   gcloud pubsub subscriptions create gbp-reviews-push --project=PROJECT_ID \
+     --topic=gbp-reviews \
+     --push-endpoint=https://YOUR-RENDER-BACKEND-DOMAIN/webhooks/google-reviews \
+     --push-auth-service-account=gbp-reviews-push@PROJECT_ID.iam.gserviceaccount.com \
+     --push-auth-token-audience=https://YOUR-RENDER-BACKEND-DOMAIN/webhooks/google-reviews \
+     --ack-deadline=600 \
+     --min-retry-delay=60s --max-retry-delay=600s \
+     --dead-letter-topic=gbp-reviews-dead-letter --max-delivery-attempts=5
+   gcloud pubsub subscriptions add-iam-policy-binding gbp-reviews-push --project=PROJECT_ID \
+     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+     --role=roles/pubsub.subscriber
+   ```
+   - The endpoint must be the public **HTTPS** Render URL — never `localhost`.
+   - **Ack deadline:** a push subscription waits for the HTTP response only up
+     to its acknowledgement deadline (default 10 s). One run makes up to
+     3 Google operations (fetch, final check, publish — each first resolves
+     the location, ~9 HTTP calls), up to 4 generation and 4 validation
+     calls, with 30 s timeouts each.
+     A normal run takes a few seconds, but use the 600 s maximum so slow
+     provider responses are not cut off and redelivered while still running.
+   - Retry delay 60–600 s plus 5 delivery attempts bound retries for
+     transient failures.
+7. **Business Profile notification setting** (per Business Profile *account*,
+   authorized as the Business Profile owner with the `business.manage`
+   token this app already holds). Run once, locally, from the project root
+   after completing OAuth:
+   ```bash
+   python - <<'PY'
+   import requests
+   from app.auth.google_oauth import load_credentials
+   from app.google.client import get_google_client
+
+   TOPIC = "projects/PROJECT_ID/topics/gbp-reviews"
+   account = get_google_client().list_accounts()["accounts"][0]["name"]
+   url = f"https://mybusinessnotifications.googleapis.com/v1/{account}/notificationSetting"
+   headers = {"Authorization": f"Bearer {load_credentials().token}"}
+   body = {"name": f"{account}/notificationSetting",
+           "pubsubTopic": TOPIC, "notificationTypes": ["NEW_REVIEW"]}
+   r = requests.patch(url, params={"updateMask": "pubsubTopic,notificationTypes"},
+                      headers=headers, json=body, timeout=30)
+   print(r.status_code, r.text)
+   print(requests.get(url, headers=headers, timeout=30).text)  # verify
+   PY
+   ```
+   This **replaces** the account's notification types: if the account already
+   subscribes to other types, include them in `notificationTypes`. The
+   setting covers every location of the account, so use
+   `AUTO_REPLY_LOCATION_IDS` to restrict automation to specific locations.
+
+### 13.5 Application configuration (Render environment variables)
+
+| Variable | Value |
+| --- | --- |
+| `PUBSUB_PUSH_AUDIENCE` | exactly the `--push-auth-token-audience` above |
+| `PUBSUB_PUSH_SERVICE_ACCOUNT` | `gbp-reviews-push@PROJECT_ID.iam.gserviceaccount.com` |
+| `GOOGLE_TOKEN_FILE` | durable token path (see 13.6) |
+| `AUTO_REPLY_ENABLED` | `false` → then `true` (see 13.7) |
+| `AUTO_REPLY_DRY_RUN` | `true` first, `false` once dry runs look right |
+| `AUTO_REPLY_LOCATION_IDS` | optional allowlist |
+| `AUTOMATION_TEST_ENDPOINT_ENABLED` | `false` in production |
+
+The webhook rejects every request while either `PUBSUB_PUSH_*` value is
+empty. The JWT is never logged.
+
+### 13.6 Render deployment requirements
+
+- **The OAuth token must survive restarts.** Render's default filesystem is
+  ephemeral: `credentials/google_token.json` is lost on every deploy,
+  restart and (free plan) spin-down, and the automation then fails with
+  "Google OAuth has not been completed". Pick one:
+  - **Persistent disk (recommended; paid instance):** attach a disk, e.g. at
+    `/var/data`, set `GOOGLE_TOKEN_FILE=/var/data/google_token.json`, and
+    complete the OAuth flow once through the deployed app (the
+    `GOOGLE_REDIRECT_URI` must be the Render backend's
+    `/auth/google/callback`, registered on the OAuth client). Refreshed
+    tokens are saved there. A disk also limits the service to one instance,
+    which this automation needs anyway.
+  - **Secret File:** run OAuth locally, upload the resulting
+    `google_token.json` as a Render Secret File, and set
+    `GOOGLE_TOKEN_FILE=/etc/secrets/google_token.json`. The app keeps
+    refreshed access tokens in memory if the file cannot be written.
+    The file contains the refresh token **and the OAuth client secret** —
+    keep it out of Git. Don't use Connect/Disconnect on Render with this
+    option; re-run OAuth locally and re-upload to rotate.
+- **Refresh tokens must not expire:** while the OAuth consent screen's
+  publishing status is **Testing**, Google expires refresh tokens after
+  7 days. Set it to **In production** for unattended use.
+- **Single process / single instance** (see 13.3).
+- **Free plan spin-down:** an idle free service sleeps after 15 minutes and
+  takes about a minute to wake. Pub/Sub keeps retrying, so events are not
+  lost, but a paid instance is more reliable (and needed for a disk).
+
+### 13.7 Rollout and testing
+
+1. Deploy with `AUTO_REPLY_ENABLED=false`. `GET /automation/status` shows
+   `"enabled": false` and `"webhook_auth_configured": true`.
+2. Publish a synthetic event (tests auth + decoding end to end; nothing is
+   processed while disabled):
+   ```bash
+   gcloud pubsub topics publish gbp-reviews --project=PROJECT_ID --message='{"type":"NEW_REVIEW","review":"accounts/ACCOUNT/locations/LOCATION/reviews/REVIEW","location":"accounts/ACCOUNT/locations/LOCATION"}'
+   ```
+   Render logs show `automation ... status=DISABLED` and an `automation_run`
+   JSON summary.
+3. Set `AUTO_REPLY_ENABLED=true` and `AUTO_REPLY_DRY_RUN=true`. Repeat with a
+   real **unanswered** review id: logs show `WOULD_PUBLISH` with the reply.
+   Then wait for a real new review and check its logs. Google documents the
+   notification's fields only informally (`reviewName` / `locationName`), so
+   the decoder accepts `type`/`notificationType`, `review`/`reviewName` and
+   `location`/`locationName`. A real notification it cannot read is logged as
+   "Pub/Sub push rejected … payload keys: [...]" and ends in the dead-letter
+   topic.
+4. When dry runs look right, set `AUTO_REPLY_DRY_RUN=false`.
+
+**Local development:** set `AUTOMATION_TEST_ENDPOINT_ENABLED=true` (with
+`AUTO_REPLY_ENABLED=true` and `AUTO_REPLY_DRY_RUN=true`) and call
+`POST /automation/test/{review_id}?location_id=...`. It runs the same
+`process_new_review()` with every gate (only the "recently finished"
+duplicate memory is skipped so the same review can be re-tested). It returns
+404 unless the flag is on.
+
+**Unit tests:** `python -m unittest discover -s tests` (automation tests:
+`tests/test_automation.py`, all Google/AI calls mocked).
+
+### 13.8 Run logs
+
+Every status transition is logged as
+`automation run=<id> review=<id> location=<id> status=<STATUS>`, and every
+run ends with one `automation_run {json}` line containing review/location
+ids, event type, generation and regeneration providers, validation results
+and reasons, publish result, final status, error stage, and the (truncated)
+reply text. No API keys, OAuth tokens, JWTs or authorization headers are
+logged.
+
+### 13.9 Limitations
+
+- Only `NEW_REVIEW` triggers automation. Reviews that arrive while it is
+  disabled are not processed later; answer them manually.
+- Location resolution uses the first Business Profile account (as the rest
+  of the app does). Events for locations in other accounts fail and are
+  acknowledged after the retry budget.
+- Duplicate protection is per process (see 13.3).
+- `FAILED_VALIDATION` and exhausted-retry reviews are visible only in the
+  logs (no database); they stay in the dashboard's unanswered list for
+  manual replies.

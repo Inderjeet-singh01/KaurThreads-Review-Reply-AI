@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Building2, CheckCircle2, LogOut, RefreshCw, Repeat, XCircle } from 'lucide-react'
+import { Bot, Building2, CheckCircle2, LogOut, RefreshCw, Repeat, XCircle } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
-import type { AuthStatus } from '../lib/types'
+import type { AuthStatus, AutomationStatus } from '../lib/types'
 import { useBusiness } from '../context/BusinessContext'
 import { useToast } from '../context/ToastContext'
 import { Avatar } from '../components/Avatar'
@@ -16,6 +16,7 @@ export function SettingsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [disconnecting, setDisconnecting] = useState(false)
+  const [automation, setAutomation] = useState<AutomationStatus | null>(null)
 
   const loadStatus = async () => {
     setLoading(true)
@@ -30,6 +31,7 @@ export function SettingsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
 
   useEffect(() => {
     void loadStatus()
+    api.getAutomationStatus().then(setAutomation).catch(() => setAutomation(null))
   }, [])
 
   const handleDisconnect = async () => {
@@ -121,6 +123,35 @@ export function SettingsPage({ onAuthExpired }: { onAuthExpired: () => void }) {
           )}
         </div>
       </section>
+
+      {/* Automatic replies (read-only: configured on the server) */}
+      {automation && (
+        <section className="card p-5">
+          <h2 className="text-sm font-bold text-slate-900">Automatic Replies</h2>
+          <div className="mt-4 flex items-center gap-3 rounded-lg border border-slate-100 bg-slate-50 p-4">
+            <Bot
+              className={
+                automation.enabled && !automation.dry_run
+                  ? 'h-5 w-5 text-emerald-500'
+                  : 'h-5 w-5 text-slate-400'
+              }
+            />
+            <div>
+              <p className="text-sm font-semibold text-slate-800">
+                {!automation.enabled
+                  ? 'Off — new reviews are only answered manually'
+                  : automation.dry_run
+                    ? 'Dry run — replies are generated and checked but not posted'
+                    : 'On — validated replies to new reviews are posted automatically'}
+              </p>
+              <p className="text-xs text-slate-500">
+                Set on the server (AUTO_REPLY_ENABLED / AUTO_REPLY_DRY_RUN). Manual
+                replies work the same either way.
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* Current business */}
       <section className="card p-5">

@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root = the directory that contains the `app/` package.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Where the Google OAuth token is persisted. This directory is gitignored.
+# Where the Google OAuth token is persisted by default. This directory is
+# gitignored. GOOGLE_TOKEN_FILE (see Settings) can point elsewhere, e.g. a
+# persistent disk in production — see the bottom of this module.
 CREDENTIALS_DIR = PROJECT_ROOT / "credentials"
 GOOGLE_TOKEN_FILE = CREDENTIALS_DIR / "google_token.json"
 
@@ -50,6 +53,42 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
 
+    # --- Google OAuth token location (optional) ----------------------------
+    # Absolute path of the OAuth token file. Empty = credentials/google_token.json.
+    # Render's default filesystem is ephemeral, so production automation needs
+    # this on a persistent disk (or a Render Secret File) — see README.
+    google_token_file: str = ""
+
+    # --- Automatic review replies (Pub/Sub webhook) ------------------------
+    # Master switch. While false, new-review events are received and logged
+    # but never processed by AI and NEVER published.
+    auto_reply_enabled: bool = False
+    # When true (and enabled), the full pipeline runs but publish_reply() is
+    # never called; the run is logged as WOULD_PUBLISH instead.
+    auto_reply_dry_run: bool = False
+    # Validation-triggered regenerations per review. Hard upper bound of 1.
+    auto_reply_max_regenerations: int = Field(default=1, ge=0, le=1)
+    # Optional comma-separated allowlist of location ids to automate. Empty =
+    # every location of the account the notification setting belongs to.
+    auto_reply_location_ids: str = ""
+    # Authenticated Pub/Sub push: the expected JWT audience (the value set as
+    # --push-auth-token-audience, or the push endpoint URL by default) and the
+    # expected service-account email in the token. Both are required; the
+    # webhook rejects every request while either is empty.
+    pubsub_push_audience: str = ""
+    pubsub_push_service_account: str = ""
+    # Development-only POST /automation/test/{review_id}. Keep false in production.
+    automation_test_endpoint_enabled: bool = False
+
+    @property
+    def auto_reply_location_list(self) -> list[str]:
+        """Parsed AUTO_REPLY_LOCATION_IDS (bare location ids)."""
+        return [
+            value.strip().rstrip("/").rsplit("/", 1)[-1]
+            for value in self.auto_reply_location_ids.split(",")
+            if value.strip()
+        ]
+
     # --- Frontend / CORS --------------------------------------------------
     # Comma-separated list of browser origins allowed to call this API.
     # Defaults cover the local Vite dev server. Set CORS_ALLOW_ORIGINS in
@@ -77,3 +116,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.google_token_file:
+    GOOGLE_TOKEN_FILE = Path(settings.google_token_file).expanduser()

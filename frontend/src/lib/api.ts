@@ -6,6 +6,7 @@
 import type {
   AuthStatus,
   AuthorizeResponse,
+  AutomationStatus,
   GenerateReplyResponse,
   LocationSummary,
   PublishResult,
@@ -104,6 +105,9 @@ export const api = {
     '/auth/google/logout',
     { method: 'POST' },
   ),
+
+  // --- Automation (read-only) -------------------------------------------
+  getAutomationStatus: () => request<AutomationStatus>('/automation/status'),
 
   // --- Locations ----------------------------------------------------------
   listLocations: () => request<LocationSummary[]>('/locations'),

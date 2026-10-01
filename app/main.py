@@ -11,10 +11,13 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.automation import router as automation_router
 from app.api.locations import router as locations_router
 from app.api.reviews import router as reviews_router
 from app.auth.google_oauth import router as google_auth_router
-from app.config import settings
+from app.config import GOOGLE_TOKEN_FILE, settings
+from app.webhooks.google_reviews import router as google_reviews_webhook_router
+from app.webhooks.pubsub import pubsub_auth_configured
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,15 +52,35 @@ if not settings.gemini_api_key:
         "GEMINI_API_KEY is not set; there is no fallback if Groq fails"
     )
 
+logger.info(
+    "Automatic replies: enabled=%s dry_run=%s max_regenerations=%d "
+    "locations=%s webhook_auth_configured=%s token_file=%s",
+    settings.auto_reply_enabled, settings.auto_reply_dry_run,
+    settings.auto_reply_max_regenerations,
+    settings.auto_reply_location_list or "all", pubsub_auth_configured(),
+    GOOGLE_TOKEN_FILE,
+)
+if settings.auto_reply_enabled and not pubsub_auth_configured():
+    logger.warning(
+        "AUTO_REPLY_ENABLED is true but PUBSUB_PUSH_AUDIENCE / "
+        "PUBSUB_PUSH_SERVICE_ACCOUNT are not set: the webhook rejects every request"
+    )
+if settings.automation_test_endpoint_enabled:
+    logger.warning(
+        "AUTOMATION_TEST_ENDPOINT_ENABLED is true: POST /automation/test/{review_id} "
+        "is exposed. Development only — disable it in production."
+    )
+
 app = FastAPI(
     title="Google Review Reply AI",
     version="1.0.0",
     description=(
-        "Phase 1: fetch unanswered Google Business Profile reviews for a "
-        "boutique, generate professional replies with Groq (Gemini "
-        "fallback), and publish them only after explicit user approval "
-        "plus a final reply check on "
-        "Google. Generated replies are NEVER published automatically."
+        "Fetch unanswered Google Business Profile reviews for a boutique, "
+        "generate professional replies with Groq (Gemini fallback), and "
+        "publish them after explicit user approval plus a final reply check "
+        "on Google. Optional automatic replies for new reviews (Pub/Sub "
+        "webhook) are OFF unless AUTO_REPLY_ENABLED=true, and publish only "
+        "after validation and a final Google check."
     ),
 )
 
@@ -72,6 +95,8 @@ app.add_middleware(
 app.include_router(google_auth_router)
 app.include_router(reviews_router)
 app.include_router(locations_router)
+app.include_router(automation_router)
+app.include_router(google_reviews_webhook_router)
 
 
 @app.get("/", tags=["Health"])

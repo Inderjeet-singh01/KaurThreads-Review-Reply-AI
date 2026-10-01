@@ -65,6 +65,17 @@ export interface AuthStatus {
   token_file?: string
 }
 
+/** GET /automation/status — read-only automatic-reply configuration. */
+export interface AutomationStatus {
+  enabled: boolean
+  dry_run: boolean
+  max_regenerations: number
+  max_processing_attempts: number
+  location_ids: string[]
+  webhook_auth_configured: boolean
+  test_endpoint_enabled: boolean
+}
+
 export interface AuthorizeResponse {
   authorization_url: string
   state: string
