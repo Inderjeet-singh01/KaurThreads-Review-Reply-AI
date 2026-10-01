@@ -3,7 +3,7 @@
 **Live deployment**
 
 - Frontend: <https://review-reply-ai-frontend.onrender.com>
-- Backend: <https://review-reply-ai-ylkw.onrender.com>
+- Backend: <https://kaurthreads.duckdns.org/>
 
 A FastAPI application for a **boutique business** that:
 
