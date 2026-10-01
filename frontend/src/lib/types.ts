@@ -74,6 +74,65 @@ export interface AutomationStatus {
   location_ids: string[]
   webhook_auth_configured: boolean
   test_endpoint_enabled: boolean
+  backfill_configured: boolean
+  backfill_delay_seconds: number
+}
+
+/** Bulk "reply to all pending reviews" (POST /automation/backfill). */
+export type BackfillJobStatus = 'STARTING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+
+export type BackfillOutcome =
+  | 'PENDING'
+  | 'PROCESSING'
+  | 'PUBLISHED'
+  | 'DRY_RUN'
+  | 'SKIPPED'
+  | 'FAILED'
+  | 'CANCELLED'
+
+export interface BackfillItem {
+  review_id: string
+  outcome: BackfillOutcome
+  final_status: string | null
+  run_id: string | null
+  attempts: number
+  generation_provider: string | null
+  validation_results: string[]
+  publish_result: string | null
+  error_stage: string | null
+  error: string | null
+  retryable: boolean
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface BackfillJob {
+  job_id: string
+  status: BackfillJobStatus
+  location_id: string | null
+  dry_run: boolean
+  total: number
+  processed: number
+  published: number
+  would_publish: number
+  skipped: number
+  failed: number
+  cancelled: number
+  current_review_id: string | null
+  cancel_requested: boolean
+  started_at: string
+  finished_at: string | null
+  error: string | null
+  items: BackfillItem[]
+}
+
+export interface BackfillStartResponse {
+  started: boolean
+  job_id: string | null
+  location_id?: string | null
+  total_reviews?: number
+  dry_run?: boolean
+  reason?: string
 }
 
 export interface AuthorizeResponse {

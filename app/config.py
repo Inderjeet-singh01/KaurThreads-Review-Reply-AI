@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     pubsub_push_service_account: str = ""
     # Development-only POST /automation/test/{review_id}. Keep false in production.
     automation_test_endpoint_enabled: bool = False
+    # Bulk "reply to all pending reviews" (POST /automation/backfill). The
+    # app has no user accounts, so starting/cancelling a backfill requires
+    # this shared admin key in the X-Automation-Key header. Empty = backfill
+    # endpoints are disabled (every start is rejected).
+    automation_backfill_key: str = ""
+    # Pause between two reviews of a backfill (Groq / Google rate limits).
+    automation_backfill_delay_seconds: float = Field(default=2.0, ge=0, le=60)
 
     @property
     def auto_reply_location_list(self) -> list[str]:

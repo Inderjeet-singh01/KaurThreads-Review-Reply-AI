@@ -383,7 +383,8 @@ async def process_new_review(
 ) -> AutomationRun:
     """Run the automatic reply workflow for one review.
 
-    Used by the Pub/Sub webhook and the development test endpoint alike.
+    Used by the Pub/Sub webhook, the bulk backfill
+    (:mod:`app.automation.backfill`) and the development test endpoint alike.
     ``delivery_attempt`` is Pub/Sub's counter (present when a dead-letter
     policy is configured). ``allow_rerun`` skips only the "recently
     finished" duplicate memory (development test endpoint); every safety

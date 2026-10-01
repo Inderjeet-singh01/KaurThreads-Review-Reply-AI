@@ -7,6 +7,8 @@ import type {
   AuthStatus,
   AuthorizeResponse,
   AutomationStatus,
+  BackfillJob,
+  BackfillStartResponse,
   GenerateReplyResponse,
   LocationSummary,
   PublishResult,
@@ -25,13 +27,16 @@ export class ApiError extends Error {
   isAuth: boolean
   /** The backend's own user-safe `detail` text, when it sent one. */
   detail: string
+  /** The parsed JSON error body (e.g. a 409 naming the running backfill job). */
+  body: unknown
 
-  constructor(message: string, status: number, detail = '') {
+  constructor(message: string, status: number, detail = '', body: unknown = undefined) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.isAuth = status === 401
     this.detail = detail
+    this.body = body
   }
 }
 
@@ -64,8 +69,8 @@ async function request<T>(
   let response: Response
   try {
     response = await fetch(`${BASE_URL}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...options.headers },
       ...options,
+      headers: { 'Content-Type': 'application/json', ...options.headers },
     })
   } catch {
     // Network error / server down / CORS failure.
@@ -74,13 +79,17 @@ async function request<T>(
 
   if (!response.ok) {
     let detail = ''
+    let body: unknown
     try {
-      const body = await response.json()
-      detail = typeof body?.detail === 'string' ? body.detail : ''
+      body = await response.json()
+      const b = body as { detail?: unknown; reason?: unknown } | null
+      // FastAPI errors carry `detail`; backfill rejections carry `reason`.
+      detail =
+        typeof b?.detail === 'string' ? b.detail : typeof b?.reason === 'string' ? b.reason : ''
     } catch {
       detail = ''
     }
-    throw new ApiError(humanMessage(response.status, detail), response.status, detail)
+    throw new ApiError(humanMessage(response.status, detail), response.status, detail, body)
   }
 
   if (response.status === 204) return undefined as T
@@ -106,8 +115,24 @@ export const api = {
     { method: 'POST' },
   ),
 
-  // --- Automation (read-only) -------------------------------------------
+  // --- Automation --------------------------------------------------------
   getAutomationStatus: () => request<AutomationStatus>('/automation/status'),
+
+  /** Start replying to every pending review. `adminKey` = AUTOMATION_BACKFILL_KEY. */
+  startBackfill: (locationId: string | null | undefined, adminKey: string) =>
+    request<BackfillStartResponse>(withLocation('/automation/backfill', locationId), {
+      method: 'POST',
+      headers: { 'X-Automation-Key': adminKey },
+    }),
+  getBackfill: (jobId: string) =>
+    request<BackfillJob>(`/automation/backfill/${encodeURIComponent(jobId)}`),
+  getLatestBackfill: (locationId?: string | null) =>
+    request<{ job: BackfillJob | null }>(withLocation('/automation/backfill', locationId)),
+  cancelBackfill: (jobId: string, adminKey: string) =>
+    request<BackfillJob>(`/automation/backfill/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+      headers: { 'X-Automation-Key': adminKey },
+    }),
 
   // --- Locations ----------------------------------------------------------
   listLocations: () => request<LocationSummary[]>('/locations'),

@@ -16,6 +16,7 @@ import { ReviewCard } from '../components/ReviewCard'
 import { ReviewListSkeleton } from '../components/Skeletons'
 import { EmptyState } from '../components/EmptyState'
 import { ErrorState } from '../components/ErrorState'
+import { BulkReplyPanel } from '../components/BulkReplyPanel'
 import { classNames, googleMapsUrl } from '../lib/utils'
 
 type Tab = 'unanswered' | 'all'
@@ -92,6 +93,14 @@ export function DashboardPage({
           }
         />
       </div>
+
+      {/* Bulk reply to every pending review (backend automation pipeline) */}
+      <BulkReplyPanel
+        locationId={business?.location_id ?? null}
+        pendingCount={loading || error ? 0 : unanswered.length}
+        onFinished={refresh}
+        onAuthExpired={onAuthExpired}
+      />
 
       {/* Tabs + filters */}
       <div className="card overflow-hidden">

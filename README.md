@@ -172,6 +172,8 @@ Copy `.env.example` to `.env` and fill it in:
 | `PUBSUB_PUSH_AUDIENCE` | for automation | Expected `aud` of the Pub/Sub push JWT. |
 | `PUBSUB_PUSH_SERVICE_ACCOUNT` | for automation | Expected `email` of the Pub/Sub push JWT. |
 | `AUTOMATION_TEST_ENDPOINT_ENABLED` | no | Development only: exposes `POST /automation/test/{review_id}`. Default `false`. |
+| `AUTOMATION_BACKFILL_KEY` | for bulk reply | Admin key required (header `X-Automation-Key`) to start/stop "Reply to All Pending Reviews". Empty = bulk reply disabled. See 13.10. |
+| `AUTOMATION_BACKFILL_DELAY_SECONDS` | no | Pause between reviews of a bulk reply (rate limits). Default `2`, max `60`. |
 
 \* At least one of `GROQ_API_KEY` / `GEMINI_API_KEY` is required; set both for
 automatic fallback.
@@ -599,6 +601,8 @@ Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
 | `AUTO_REPLY_DRY_RUN` | `true` first, `false` once dry runs look right |
 | `AUTO_REPLY_LOCATION_IDS` | optional allowlist |
 | `AUTOMATION_TEST_ENDPOINT_ENABLED` | `false` in production |
+| `AUTOMATION_BACKFILL_KEY` | long random string (bulk reply, see 13.10) |
+| `AUTOMATION_BACKFILL_DELAY_SECONDS` | optional, default `2` |
 
 The webhook rejects every request while either `PUBSUB_PUSH_*` value is
 empty. The JWT is never logged.
@@ -686,8 +690,9 @@ logged.
 
 ### 13.9 Limitations
 
-- Only `NEW_REVIEW` triggers automation. Reviews that arrive while it is
-  disabled are not processed later; answer them manually.
+- Only `NEW_REVIEW` triggers real-time automation. Reviews that arrived
+  while it was disabled are not processed automatically; answer them
+  manually or with the bulk reply (13.10).
 - Location resolution uses the first Business Profile account (as the rest
   of the app does). Events for locations in other accounts fail and are
   acknowledged after the retry budget.
@@ -695,3 +700,62 @@ logged.
 - `FAILED_VALIDATION` and exhausted-retry reviews are visible only in the
   logs (no database); they stay in the dashboard's unanswered list for
   manual replies.
+
+### 13.10 Bulk reply to all pending reviews (backfill)
+
+The dashboard's **Reply to All Pending Reviews (N)** button answers every
+review that currently has no business reply. It does not add a second
+pipeline: `app/automation/backfill.py` calls the same
+`process_new_review()` as the Pub/Sub webhook for each review, so the fresh
+Google fetch, "already replied" check, generation (Groq → Gemini),
+validation with at most one regeneration, final Google check,
+`AUTO_REPLY_DRY_RUN` gate and per-review lock all apply unchanged.
+
+```
+POST /automation/backfill?location_id=…        start (X-Automation-Key required) → 202 {job_id, total_reviews}
+GET  /automation/backfill/{job_id}              progress / result (no reply text, no secrets)
+GET  /automation/backfill?location_id=…         running job, else the most recent one (page-refresh recovery)
+POST /automation/backfill/{job_id}/cancel       stop after the current review (X-Automation-Key required)
+```
+
+- **Sequential:** one review at a time, `AUTOMATION_BACKFILL_DELAY_SECONDS`
+  between reviews. A failed review is recorded and the batch continues.
+- **Retries:** a retryable failure (Google 5xx/429, AI provider outage) is
+  retried up to `MAX_PROCESSING_ATTEMPTS` (3) with a growing pause; the
+  processor's shared retry budget applies. A validation FAIL after the one
+  regeneration is final (left for a manual reply).
+- **No double replies:** every attempt re-reads the review from Google and
+  checks again right before publishing; only one backfill can run at a
+  time (a second start returns `409 {"started": false, "reason": "A
+  backfill job is already running.", "job_id": …}`); the per-review lock
+  also blocks a webhook run for the same review.
+- **Gates:** rejected while `AUTO_REPLY_ENABLED=false` or when the location
+  is outside `AUTO_REPLY_LOCATION_IDS`. With `AUTO_REPLY_DRY_RUN=true` every
+  review ends as `DRY_RUN` (logged `WOULD_PUBLISH`) and nothing is sent.
+- **Protection:** the app has no user accounts, so start/cancel require the
+  shared admin key `AUTOMATION_BACKFILL_KEY`, entered in the confirmation
+  dialog (remembered in that browser's localStorage, cleared if rejected).
+  The endpoints are disabled (503) while the key is not set.
+- **Job state is in memory** (no database, like the duplicate memory in
+  13.3). A restart or deploy during a bulk reply loses the job record (the
+  UI reports "interrupted") — but never causes double replies: published
+  reviews drop out of the unanswered list, so starting again continues
+  with the rest. Render's free plan spins down after 15 minutes without
+  inbound requests; keep the dashboard open during long runs (its polling
+  counts as traffic).
+- **Re-runs within 24 h:** the processor remembers `FAILED_VALIDATION` and
+  `DRY_RUN` outcomes per review for 24 h (13.3), so a second bulk reply in
+  the same process reports those reviews as `SKIPPED` ("recently processed")
+  instead of spending AI calls again. A deploy/restart clears this memory.
+- **Logs:** `BACKFILL_STARTED job=… total=… location=… dry_run=…`,
+  `BACKFILL job=… review=… status=PROCESSING`, `BACKFILL job=… review=…
+  run=… status=PUBLISHED|DRY_RUN|SKIPPED_ALREADY_REPLIED|…`, `… status=FAILED
+  final_status=… stage=…`, and `BACKFILL_COMPLETED job=… total=…
+  published=… would_publish=… skipped=… failed=… cancelled=…`. Each review's
+  processor lines (`automation run=…`) share its `run` id.
+
+**Rollout:** set `AUTOMATION_BACKFILL_KEY` and `AUTO_REPLY_DRY_RUN=true`,
+deploy, run the bulk reply, confirm on Google that nothing was posted and
+that the logs show `WOULD_PUBLISH` for the reviews you expect. Then set
+`AUTO_REPLY_DRY_RUN=false`, deploy (this also clears the in-memory
+"recently dry-run" memory), and run it once.
