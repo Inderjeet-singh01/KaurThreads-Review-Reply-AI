@@ -3,7 +3,8 @@
 Handlers are thin: Google operations come from :mod:`app.google.reviews` and
 reply generation from :mod:`app.ai.reply_generator` (Groq primary,
 Gemini fallback). The manual "Check Reply" validation comes from
-:mod:`app.ai.gemini_validator` and never publishes or regenerates anything.
+:mod:`app.ai.reply_validator` (same Groq-then-Gemini order) and never
+publishes or regenerates anything.
 
 Publishing is only ever triggered by an explicit call to
 ``POST /reviews/{review_id}/publish`` with the user-approved final text, and
@@ -17,12 +18,12 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.ai.gemini_validator import (
-    GeminiValidationError,
-    GeminiValidationNotConfiguredError,
+from app.ai.reply_generator import ReplyGenerationError, generate_review_reply
+from app.ai.reply_validator import (
+    ReplyValidationError,
+    ReplyValidationNotConfiguredError,
     validate_review_reply,
 )
-from app.ai.reply_generator import ReplyGenerationError, generate_review_reply
 from app.auth.google_oauth import GoogleOAuthError
 from app.google.client import GoogleAPIError
 from app.google.reviews import (
@@ -79,12 +80,25 @@ def _to_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, ReplyGenerationError):
         return HTTPException(status_code=502, detail=str(exc))
-    if isinstance(exc, GeminiValidationNotConfiguredError):
+    if isinstance(exc, ReplyValidationNotConfiguredError):
         return HTTPException(
             status_code=503,
-            detail="Reply checking is not configured (GEMINI_API_KEY is missing).",
+            detail="Reply checking is not configured (set GROQ_API_KEY or GEMINI_API_KEY).",
         )
-    if isinstance(exc, GeminiValidationError):
+    if isinstance(exc, ReplyValidationError) and exc.status == 429:
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Reply checking is unavailable: the AI usage limit has been "
+                "reached. Please try again later."
+            ),
+        )
+    if isinstance(exc, ReplyValidationError) and exc.status == 503:
+        return HTTPException(
+            status_code=503,
+            detail="The AI service is overloaded right now. Please try again in a moment.",
+        )
+    if isinstance(exc, ReplyValidationError):
         return HTTPException(
             status_code=502,
             detail="Could not validate the reply right now. Please try again in a moment.",
@@ -183,7 +197,8 @@ def validate_reply(
 
     The review is re-fetched from Google (the source of truth); the frontend
     only supplies the draft text. Cheap deterministic checks run first, then
-    at most one Gemini call. Nothing is published, regenerated, or stored.
+    one Groq call, and one Gemini call only if Groq fails. Nothing is
+    published, regenerated, or stored.
     """
     try:
         raw_review = get_review(review_id, location_id=location_id)
@@ -201,7 +216,7 @@ def validate_reply(
 
     try:
         return validate_review_reply(normalize_review(raw_review), payload.reply)
-    except GeminiValidationError as exc:
+    except ReplyValidationError as exc:
         raise _to_http_error(exc) from exc
 
 

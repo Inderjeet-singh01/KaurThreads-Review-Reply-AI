@@ -96,7 +96,7 @@ google-review-reply/
 │   │   ├── groq_client.py       # Groq integration (primary provider)
 │   │   ├── gemini_client.py     # Gemini integration (fallback provider)
 │   │   ├── reply_generator.py   # Groq → Gemini fallback orchestration
-│   │   └── gemini_validator.py  # manual "Check Reply" validation (PASS/FAIL)
+│   │   └── reply_validator.py   # manual "Check Reply" validation (Groq → Gemini fallback)
 │   └── schemas/
 │       └── review.py            # Pydantic API contracts
 ├── credentials/                 # gitignored; google_token.json created after first OAuth
@@ -150,7 +150,7 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_CLIENT_SECRET` | yes | OAuth client secret. |
 | `GOOGLE_REDIRECT_URI` | yes | Must match the redirect URI registered with the OAuth client. Default `http://localhost:8000/auth/google/callback`. |
 | `GROQ_API_KEY` | yes* | Groq API key from <https://console.groq.com/keys> (primary provider). |
-| `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (automatic generation fallback + Check Reply validation). |
+| `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (fallback for generation and Check Reply). |
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
 | `GROQ_MODEL` | no | Groq model for generation. Default `llama-3.3-70b-versatile`. |
 | `GEMINI_MODEL` | no | Gemini model for fallback generation. Default `gemini-3.8-flash`. |
@@ -281,9 +281,11 @@ draft), then:
 2. Cheap deterministic checks — empty text, over Google's 4096-byte limit,
    broken characters, unfilled placeholders like `[Customer Name]`, obvious
    AI/prompt disclosure ("As an AI…"). A problem here returns `FAIL` without
-   calling Gemini.
-3. Otherwise exactly **one** Gemini call (`GEMINI_MODEL`, default
-   `gemini-3.8-flash`, no retries) returns the structured verdict.
+   calling any AI provider.
+3. Otherwise the same provider order as reply generation: **one** Groq call
+   (`GROQ_MODEL`) returns the structured verdict; only if Groq fails (missing
+   key, rate limit, timeout, unreadable answer, …) is **one** Gemini call
+   (`GEMINI_MODEL`) made instead. No retries.
 
 ```json
 {
@@ -302,8 +304,9 @@ draft), then:
 ```
 
 On `PASS`, `passed` is `true`, `reason` is `null` and every check is `true`.
-Requires `GEMINI_API_KEY`; without it the endpoint returns `503` (the app
-still starts). A Gemini failure returns `502` with a user-safe message.
+Needs `GROQ_API_KEY` and/or `GEMINI_API_KEY`. If every configured provider
+fails the endpoint returns `502` with a user-safe message, or `503` when the
+cause is a usage limit / overloaded provider (the message says which).
 
 ### Publish the user-approved final reply
 

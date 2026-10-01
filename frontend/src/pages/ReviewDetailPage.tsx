@@ -122,8 +122,11 @@ export function ReviewDetailPage({ onAuthExpired }: { onAuthExpired: () => void 
       if (handleAuthError(err)) return
       const alreadyAnswered = err instanceof ApiError && err.status === 409
       const message = alreadyAnswered ? err.message : 'Could not validate the reply.'
+      // Inline panel shows the backend's specific reason (e.g. Gemini quota
+      // reached or overloaded); the toast stays short.
+      const detail = err instanceof ApiError && err.status >= 500 ? err.detail : ''
       setValidationResult(null)
-      setValidationError(message)
+      setValidationError(detail ? `${message} ${detail}` : message)
       toast.error(message)
       // Answered elsewhere: resync so the page switches to the posted reply.
       if (alreadyAnswered) void refresh()

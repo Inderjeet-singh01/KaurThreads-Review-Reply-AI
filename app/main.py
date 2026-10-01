@@ -46,7 +46,7 @@ if not settings.groq_api_key:
     logger.warning("GROQ_API_KEY is not set; replies will be generated with Gemini only")
 if not settings.gemini_api_key:
     logger.warning(
-        "GEMINI_API_KEY is not set; no Groq fallback and Check Reply is unavailable"
+        "GEMINI_API_KEY is not set; there is no fallback if Groq fails"
     )
 
 app = FastAPI(

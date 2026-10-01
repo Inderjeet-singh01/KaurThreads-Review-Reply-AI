@@ -22,12 +22,15 @@ export class ApiError extends Error {
   status: number
   /** True when the failure is an authentication/session problem. */
   isAuth: boolean
+  /** The backend's own user-safe `detail` text, when it sent one. */
+  detail: string
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, detail = '') {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.isAuth = status === 401
+    this.detail = detail
   }
 }
 
@@ -76,7 +79,7 @@ async function request<T>(
     } catch {
       detail = ''
     }
-    throw new ApiError(humanMessage(response.status, detail), response.status)
+    throw new ApiError(humanMessage(response.status, detail), response.status, detail)
   }
 
   if (response.status === 204) return undefined as T
