@@ -77,6 +77,7 @@ from app.config import settings
 from app.google.client import GoogleAPIError
 from app.google.reviews import (
     GoogleReviewError,
+    LocationNotFoundError,
     ReviewNotFoundError,
     get_review,
     has_reply,
@@ -286,8 +287,13 @@ def _is_retryable_google_error(exc: Exception) -> bool:
         return True  # e.g. token refresh hiccup; bounded by the retry budget
     if isinstance(exc, GoogleAPIError):
         return exc.status is None or exc.status in (401, 408, 429) or exc.status >= 500
-    # GoogleReviewError subclasses: LocationNotFoundError wraps API failures
-    # while resolving the location, so give it the bounded retry too.
+    if isinstance(exc, LocationNotFoundError):
+        # Raised "from" a GoogleAPIError when listing accounts/locations
+        # failed (judge by that status); without a cause the location simply
+        # is not in the account (e.g. a synthetic TEST_LOCATION push) and
+        # redelivery can never fix it.
+        cause = exc.__cause__
+        return isinstance(cause, GoogleAPIError) and _is_retryable_google_error(cause)
     return not isinstance(exc, ReviewNotFoundError)
 
 

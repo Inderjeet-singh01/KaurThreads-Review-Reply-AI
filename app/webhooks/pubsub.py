@@ -140,6 +140,7 @@ class ReviewNotification:
     raw_location: str = "-"
     review_issue: str | None = None
     publish_time: str | None = None
+    payload_keys: tuple[str, ...] = ()
 
 
 def _first_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
@@ -246,6 +247,7 @@ def parse_push_body(body: Any) -> ReviewNotification:
         "raw_review": sanitize_for_log(raw_review),
         "raw_location": sanitize_for_log(raw_location),
         "publish_time": publish_time,
+        "payload_keys": tuple(sorted(sanitize_for_log(key, 40) for key in data)),
     }
 
     if event_type != "NEW_REVIEW":

@@ -14,8 +14,11 @@ and translate the outcome into Pub/Sub acknowledgement semantics:
 * 409  — the same review is being processed right now; redeliver later.
 * 503  — transient Google / AI infrastructure failure; redeliver (bounded
   by the processor's retry budget and the subscription's retry policy).
-* 400  — undecodable message, or a NEW_REVIEW without any valid location
-  (redelivery cannot fix it; a dead-letter topic collects these).
+* 200 REJECTED_INVALID_MESSAGE — undecodable message, or a NEW_REVIEW
+  without any valid location. Redelivery cannot fix it and Pub/Sub retries
+  every non-2xx (there is no dead-letter policy), so it is acknowledged and
+  logged as WEBHOOK_REJECTED instead. Synthetic / foreign locations (e.g.
+  ``TEST_LOCATION``) are acknowledged as IGNORED before any Google call.
 * 401 / 403 — not an authenticated Pub/Sub push; nothing is processed.
 
 Every request is traced with ``WEBHOOK_RECEIVED`` / ``WEBHOOK_REJECTED`` /
@@ -70,7 +73,7 @@ async def google_reviews_webhook(request: Request) -> JSONResponse:
         body: Any = await request.json()
     except ValueError:
         logger.warning("WEBHOOK_REJECTED stage=PARSING reason=body is not JSON")
-        raise HTTPException(status_code=400, detail="Body must be a Pub/Sub push JSON envelope.")
+        return _rejected()
     try:
         event = parse_push_body(body)
     except MalformedPushError as exc:
@@ -80,17 +83,18 @@ async def google_reviews_webhook(request: Request) -> JSONResponse:
             "Pub/Sub push rejected: %s",
             exc.message_id or "-", exc,
         )
-        raise HTTPException(status_code=400, detail="Malformed Pub/Sub message.")
+        return _rejected()
 
     stage = "PARSED" if event.review_id else "FALLBACK_RESOLUTION"
     logger.info(
         "WEBHOOK_RECEIVED message_id=%s delivery_attempt=%s publish_time=%s event=%s "
         "location_raw=%s review_raw=%s normalized_location=%s normalized_review=%s "
-        "review_id=%s stage=%s%s",
+        "review_id=%s stage=%s%s%s",
         event.message_id or "-", event.delivery_attempt, event.publish_time or "-",
         event.event_type, event.raw_location, event.raw_review,
         event.location_id or "-", event.review_resource_name or "-", event.review_id or "-",
         stage, f" review_issue={event.review_issue!r}" if event.review_issue else "",
+        f" payload_keys={list(event.payload_keys)}" if not event.review_id else "",
     )
 
     if event.event_type != "NEW_REVIEW":
@@ -117,6 +121,11 @@ async def google_reviews_webhook(request: Request) -> JSONResponse:
         "resolution": run.resolution,
     }
     return JSONResponse(content, status_code=status_code)
+
+
+def _rejected() -> JSONResponse:
+    # Acknowledged (2xx): a permanently unusable message must not be redelivered.
+    return JSONResponse({"status": "REJECTED_INVALID_MESSAGE"})
 
 
 def _http_status(run: AutomationRun) -> int:

@@ -478,7 +478,8 @@ automation reuses it unchanged.
 | `PUBLISHED`, `DRY_RUN`, `SKIPPED_ALREADY_REPLIED`, `FAILED_VALIDATION`, `DISABLED`, `IGNORED` (other notification types / location not allowlisted), `SKIPPED_NOT_FOUND`, `SKIPPED_NO_UNANSWERED_REVIEW` (fallback found nothing to do), recently-finished `DUPLICATE` | 200 | acknowledged |
 | Same review (or same fallback message) already being processed (`DUPLICATE`) | 409 | redelivered later |
 | Transient Google/AI failure (`ERROR`, `FAILED_GENERATION`), incl. a failed fallback listing | 503 | redelivered |
-| Undecodable message, or NEW_REVIEW with **no valid location** / location contradicting the review | 400 | redelivered → dead-letter topic |
+| Undecodable message, or NEW_REVIEW with **no valid location** / location contradicting the review (`REJECTED_INVALID_MESSAGE`) | 200 | acknowledged (logged as `WEBHOOK_REJECTED`) |
+| Synthetic / foreign location (non-numeric id such as `TEST_LOCATION`, or not `GOOGLE_LOCATION_ID`) — `IGNORED` before any Google call; location not in the Google account — `ERROR`, not retryable | 200 | acknowledged |
 | Missing / invalid JWT | 401 / 403 | redelivered (fix the configuration) |
 
 A NEW_REVIEW whose review value has an unexpected format is **not** a 400
@@ -888,7 +889,7 @@ and of leading/trailing slashes; a review may also be an object with a
 `reviews/{r}` or a bare `{r}` (the last two need a valid `location`).
 Every id segment must be a plain id (`A-Z a-z 0-9 - _ . ~ = +`, no empty or
 `..` segments), so traversal or junk never reaches a Google URL. A location
-or account that contradicts the review resource name is rejected (400).
+or account that contradicts the review resource name is rejected (acknowledged, `REJECTED_INVALID_MESSAGE`).
 
 **Fallback resolution.** When a NEW_REVIEW has a valid location but its
 review reference is missing or unparseable, the webhook does not fail. It lists the location's reviews,

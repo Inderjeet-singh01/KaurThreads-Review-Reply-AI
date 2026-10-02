@@ -236,8 +236,41 @@ def _log_summary(run: AutomationRun) -> AutomationRun:
 
 
 # --- Entry point ----------------------------------------------------------------------
+def _location_issue(location_id: str | None) -> str | None:
+    """Why a notification's location can never be processed (else ``None``).
+
+    Checked before any Google call. Business Profile location ids are
+    numeric; anything else (``TEST_LOCATION``, ``YOUR_LOCATION_ID``) is a
+    synthetic or placeholder push. When GOOGLE_LOCATION_ID is configured it
+    stays authoritative: notifications for another location are not ours.
+    """
+    if not location_id or not location_id.isdigit():
+        return "location id is not a Business Profile location id"
+    configured = settings.google_location_id.strip().strip("/")
+    if configured and configured.rsplit("/", 1)[-1] != location_id:
+        return "location does not match GOOGLE_LOCATION_ID"
+    return None
+
+
 async def process_review_notification(event: ReviewNotification) -> AutomationRun:
     """Process a decoded NEW_REVIEW notification (exact review, else fallback)."""
+    if (issue := _location_issue(event.location_id)) is not None:
+        # Permanent: acknowledge (2xx) so Pub/Sub stops redelivering it.
+        run = AutomationRun(
+            review_id=event.review_id or "",
+            location_id=event.location_id,
+            event_type=event.event_type,
+            review_resource_name=event.review_resource_name,
+            trigger="webhook",
+            message_id=event.message_id,
+        )
+        run.error_stage = "location_check"
+        run.error = f"InvalidNotificationLocation: {issue}"
+        _set_status(
+            run, AutomationStatus.IGNORED,
+            f"reason={issue!r} location_raw={event.raw_location} review_raw={event.raw_review}",
+        )
+        return _log_summary(run)
     if event.review_id:
         return await process_new_review(
             event.review_id,

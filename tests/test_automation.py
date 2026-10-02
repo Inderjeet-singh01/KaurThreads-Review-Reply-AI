@@ -51,7 +51,7 @@ from app.webhooks import google_reviews as webhook
 from app.webhooks.pubsub import MalformedPushError, parse_push_body
 
 REVIEW_ID = "r1"
-LOCATION_ID = "loc9"
+LOCATION_ID = "9876543210"
 REVIEW_NAME = f"accounts/acct1/locations/{LOCATION_ID}/reviews/{REVIEW_ID}"
 AUDIENCE = "https://backend.example.com/webhooks/google-reviews"
 PUSH_SA = "pubsub-push@my-project.iam.gserviceaccount.com"
@@ -174,6 +174,7 @@ class AutomationTestCase(unittest.IsolatedAsyncioTestCase):
             auto_reply_dry_run=False,
             auto_reply_max_regenerations=1,
             auto_reply_location_ids="",
+            google_location_id="",
             groq_api_key="gsk-test",
             gemini_api_key="gm-test",
             pubsub_push_audience=AUDIENCE,
@@ -670,15 +671,18 @@ class WebhookTests(AutomationTestCase):
             _push_body({"type": "NEW_REVIEW", "review": "accounts/a/locations/l/reviews/x/../y"}),
             _push_body({**NEW_REVIEW_DATA, "location": "accounts/acct1/locations/OTHER"}),
         ]
+        # Acknowledged (2xx): Pub/Sub would redeliver a permanently bad message forever.
         for body in bodies:
             with self.subTest(body=body):
                 response = self.post(body)
-                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "REJECTED_INVALID_MESSAGE")
         response = self.client.post(
             "/webhooks/google-reviews", content=b"{not json",
             headers={"Authorization": f"Bearer {_jwt()}", "Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "REJECTED_INVALID_MESSAGE")
         self.get_review.assert_not_called()
         self.groq.assert_not_called()
         self.publish.assert_not_called()

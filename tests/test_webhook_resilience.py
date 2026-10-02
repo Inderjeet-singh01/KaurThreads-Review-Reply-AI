@@ -40,7 +40,7 @@ from app.google.resource_names import (
     parse_review_reference,
     sanitize_for_log,
 )
-from app.google.reviews import ReviewNotFoundError
+from app.google.reviews import LocationNotFoundError, ReviewNotFoundError
 from app.webhooks import google_reviews as webhook
 from app.webhooks.pubsub import MalformedPushError, parse_push_body
 from tests.test_automation import (
@@ -363,9 +363,66 @@ class WebhookResolutionTests(ResilienceTestCase):
         self.add_review("new1")
         with self.assertLogs("app.webhooks.google_reviews", level="WARNING") as logs:
             response = self.post({"type": "NEW_REVIEW", "review": "x/../y"})
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "REJECTED_INVALID_MESSAGE")
         self.assertIn("WEBHOOK_REJECTED message_id=msg-1 stage=PARSING", "\n".join(logs.output))
         self.get_review.assert_not_called()
+        self.publish.assert_not_called()
+
+    # Synthetic / foreign locations and location-resolution failures
+    def test_synthetic_test_payload_is_acknowledged_without_google_calls(self):
+        self.add_review("real-id")
+        location_name = self._patch("app.google.reviews.get_location_name")
+        for message_id, data in (
+            ("t1", {"type": "NEW_REVIEW", "location": "TEST_LOCATION", "review": "TEST_REVIEW"}),
+            ("t2", _new_review(None, location="TEST_LOCATION")),  # fallback path
+            ("t3", _new_review("r1", location="accounts/1/locations/YOUR_LOCATION_ID")),
+        ):
+            with self.subTest(data=data):
+                response = self.post(data, message_id=message_id)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "IGNORED")
+        location_name.assert_not_called()
+        self.get_review.assert_not_called()
+        self.list_reviews.assert_not_called()
+        self.groq.assert_not_called()
+        self.publish.assert_not_called()
+
+    def test_configured_location_is_authoritative(self):
+        self._patch_settings(google_location_id=PROD_LOCATION_ID)
+        self.add_review("r1")
+        response = self.post(_new_review(f"{LOCATION}/reviews/r1"))  # another location
+        self.assertEqual(response.json()["status"], "IGNORED")
+        self.get_review.assert_not_called()
+        # A real Google notification for the configured location is processed.
+        self._patch_settings(auto_reply_dry_run=True)
+        response = self.post(_new_review(f"{PROD_LOCATION}/reviews/r1", location=PROD_LOCATION),
+                             message_id="msg-2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "DRY_RUN")
+        self.get_review.assert_called_with("r1", location_id=PROD_LOCATION_ID)
+        self.publish.assert_not_called()
+
+    def test_location_missing_from_account_is_not_retried(self):
+        self.get_review.side_effect = LocationNotFoundError(
+            "Location '111' (GOOGLE_LOCATION_ID) was not found in account accounts/1."
+        )
+        response = self.post(_new_review("accounts/1/locations/111/reviews/r1",
+                                         location="accounts/1/locations/111"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ERROR")
+        self.assertEqual(self.get_review.call_count, 1)
+        self.publish.assert_not_called()
+
+    def test_transient_location_lookup_failure_is_retried(self):
+        try:
+            raise LocationNotFoundError("Could not list locations") from GoogleAPIError(
+                "unavailable", status=503)
+        except LocationNotFoundError as exc:
+            self.get_review.side_effect = exc
+        response = self.post(_new_review(f"{LOCATION}/reviews/r1"))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "ERROR")
         self.publish.assert_not_called()
 
     # 17
