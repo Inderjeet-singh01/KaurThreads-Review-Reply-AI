@@ -71,6 +71,19 @@ if settings.auto_reply_enabled and not pubsub_auth_configured():
 logger.info(
     "Bulk backfill: delay_seconds=%s", settings.automation_backfill_delay_seconds,
 )
+logger.info(
+    "Reconciliation: enabled=%s auth_configured=%s max_reviews=%d lookback_minutes=%d "
+    "verify_after_publish=%s",
+    settings.reconciliation_enabled, settings.reconciliation_auth_configured,
+    settings.reconciliation_max_reviews, settings.reconciliation_lookback_minutes,
+    settings.auto_reply_verify_after_publish,
+)
+if settings.auto_reply_enabled and settings.reconciliation_enabled \
+        and not settings.reconciliation_auth_configured:
+    logger.warning(
+        "RECONCILIATION_SECRET is not set (16+ characters): POST /automation/reconcile is "
+        "closed, so reviews whose Pub/Sub notification is missed are not retried automatically"
+    )
 if settings.automation_test_endpoint_enabled:
     logger.warning(
         "AUTOMATION_TEST_ENDPOINT_ENABLED is true: POST /automation/test/{review_id} "

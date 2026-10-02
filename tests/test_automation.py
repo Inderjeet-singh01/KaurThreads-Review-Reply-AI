@@ -217,11 +217,13 @@ class AutomationTestCase(unittest.IsolatedAsyncioTestCase):
 class ProcessorFlowTests(AutomationTestCase):
     # 1 / 16
     async def test_new_unanswered_review_is_published(self):
+        self.get_review.side_effect = [RAW_REVIEW, RAW_REVIEW, REPLIED_REVIEW]
         run = await self.run_review()
         self.assertEqual(run.status, AutomationStatus.PUBLISHED)
         self.assertFalse(run.retryable)
-        # Initial fetch + final check, both against Google.
-        self.assertEqual(self.get_review.call_count, 2)
+        # Initial fetch + final check + post-publish verification, all against Google.
+        self.assertEqual(self.get_review.call_count, 3)
+        self.assertTrue(run.publish_verified)
         self.get_review.assert_called_with(REVIEW_ID, location_id=LOCATION_ID)
         self.validate.assert_called_once()
         self.publish.assert_called_once_with(REVIEW_ID, GOOD_REPLY, location_id=LOCATION_ID)
@@ -722,7 +724,7 @@ class WebhookTests(AutomationTestCase):
                 status=AutomationStatus.DUPLICATE, retryable=True,
             )
 
-        with mock.patch.object(webhook, "process_new_review", side_effect=busy):
+        with mock.patch.object(webhook, "process_review_notification", side_effect=busy):
             response = self.post(_push_body(NEW_REVIEW_DATA))
         self.assertEqual(response.status_code, 409)
 

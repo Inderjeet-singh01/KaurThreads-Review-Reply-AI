@@ -86,6 +86,28 @@ class Settings(BaseSettings):
     # limit, Google 5xx); multiplied by the attempt number. AI quotas are per
     # minute, so a short pause would just fail again.
     automation_backfill_retry_delay_seconds: float = Field(default=15.0, ge=0, le=300)
+    # After a successful publish, re-read the review once to confirm Google
+    # shows the reply (logged; a failed check never undoes PUBLISHED).
+    auto_reply_verify_after_publish: bool = True
+
+    # --- Reconciliation (safety net for delayed / missed Pub/Sub events) ---
+    # POST /automation/reconcile, called by an external scheduler. It finds
+    # recent unanswered reviews and runs each through process_new_review().
+    reconciliation_enabled: bool = True
+    # Shared secret the scheduler sends (Authorization: Bearer <secret> or
+    # X-Reconcile-Secret). Empty / shorter than 16 chars = endpoint closed.
+    reconciliation_secret: str = ""
+    # Reviews processed per reconciliation run (newest first).
+    reconciliation_max_reviews: int = Field(default=10, ge=1, le=100)
+    # Only reviews created/updated within this window are candidates, for
+    # reconciliation AND for the webhook's fallback resolution. 0 = no limit
+    # (every unanswered review, like the bulk backfill). Default: 7 days,
+    # Pub/Sub's default message retention.
+    reconciliation_lookback_minutes: int = Field(default=7 * 24 * 60, ge=0)
+
+    @property
+    def reconciliation_auth_configured(self) -> bool:
+        return len(self.reconciliation_secret.strip()) >= 16
 
     @property
     def auto_reply_location_list(self) -> list[str]:

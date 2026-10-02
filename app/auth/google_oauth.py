@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -50,6 +51,15 @@ _current_flow: Flow | None = None
 # Google OAuth client IDs always look like:
 # 123456789012-abc123def456.apps.googleusercontent.com
 _CLIENT_ID_RE = re.compile(r"^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$")
+
+# Process-wide credentials cache. GOOGLE_TOKEN_FILE may be read-only (a
+# Render Secret File), so a refreshed access token can only live in memory:
+# without this cache every Google call would re-read the stale file and
+# refresh again. The entry is keyed by the file's path, mtime and size, so a
+# new token (OAuth callback, re-upload) or a deleted file is picked up.
+# The lock serializes refreshes across the automation's worker threads.
+_credentials_lock = threading.RLock()
+_cached_credentials: tuple[tuple[str, int, int], Credentials] | None = None
 
 
 class GoogleOAuthError(Exception):
@@ -195,7 +205,8 @@ def _persist_refreshed(credentials: Credentials) -> None:
     except OSError as exc:
         logger.warning(
             "Refreshed Google access token could not be written to %s (%s); "
-            "continuing with the in-memory token",
+            "continuing with the in-memory token (expected for a read-only "
+            "Render Secret File; the refresh token is unchanged)",
             GOOGLE_TOKEN_FILE, type(exc).__name__,
         )
 
@@ -207,10 +218,11 @@ def refresh_credentials_if_needed(credentials: Credentials) -> None:
     benefits from it. Raises the underlying refresh error when refreshing
     fails.
     """
-    if credentials.expired and credentials.refresh_token:
-        logger.info("Google access token expired; refreshing it")
-        credentials.refresh(Request())
-        _persist_refreshed(credentials)
+    with _credentials_lock:
+        if credentials.expired and credentials.refresh_token:
+            logger.info("Google access token expired; refreshing it")
+            credentials.refresh(Request())
+            _persist_refreshed(credentials)
 
 
 def force_refresh_credentials(credentials: Credentials) -> bool:
@@ -221,8 +233,9 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
     if not credentials.refresh_token:
         return False
     try:
-        credentials.refresh(Request())
-        _persist_refreshed(credentials)
+        with _credentials_lock:
+            credentials.refresh(Request())
+            _persist_refreshed(credentials)
         logger.info("Google access token force-refreshed")
         return True
     except Exception as exc:
@@ -230,27 +243,63 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
         return False
 
 
+def _token_file_key() -> tuple[str, int, int] | None:
+    try:
+        stat = GOOGLE_TOKEN_FILE.stat()
+    except OSError:
+        return None
+    return (str(GOOGLE_TOKEN_FILE), stat.st_mtime_ns, stat.st_size)
+
+
+def clear_credentials_cache() -> None:
+    """Drop the in-memory credentials (logout, tests)."""
+    global _cached_credentials
+    with _credentials_lock:
+        _cached_credentials = None
+
+
 def load_credentials() -> Credentials:
     """Load usable Google credentials from ``GOOGLE_TOKEN_FILE``.
 
     Raises GoogleOAuthError when the OAuth flow has not been completed or the
     stored credentials can no longer be used.
+
+    The credentials object is reused across calls while the file is
+    unchanged (see ``_cached_credentials``), so an access token refreshed in
+    memory — e.g. because the file is a read-only Render Secret File — is
+    used until it expires instead of being refreshed on every call. An
+    expired access token is never a reason to re-authenticate: it is
+    refreshed with the stored refresh token.
     """
+    global _cached_credentials
     if not GOOGLE_TOKEN_FILE.exists():
+        clear_credentials_cache()
         raise GoogleOAuthError(
             "Google OAuth has not been completed yet: no token file at "
             f"{GOOGLE_TOKEN_FILE}. Complete the flow via "
             "GET /auth/google/authorize."
         )
-    try:
-        credentials = Credentials.from_authorized_user_file(
-            str(GOOGLE_TOKEN_FILE), SCOPES
-        )
-    except (OSError, ValueError, KeyError) as exc:
-        raise GoogleOAuthError(
-            f"Could not read the Google credentials file at {GOOGLE_TOKEN_FILE}. "
-            "Delete the file and complete the OAuth flow again."
-        ) from exc
+    with _credentials_lock:
+        key = _token_file_key()
+        if _cached_credentials is not None and key is not None and _cached_credentials[0] == key:
+            credentials = _cached_credentials[1]
+        else:
+            try:
+                credentials = Credentials.from_authorized_user_file(
+                    str(GOOGLE_TOKEN_FILE), SCOPES
+                )
+            except (OSError, ValueError, KeyError) as exc:
+                _cached_credentials = None
+                raise GoogleOAuthError(
+                    f"Could not read the Google credentials file at {GOOGLE_TOKEN_FILE}. "
+                    "Delete the file and complete the OAuth flow again."
+                ) from exc
+        return _ensure_usable(credentials)
+
+
+def _ensure_usable(credentials: Credentials) -> Credentials:
+    """Refresh if needed, cache, and return credentials (lock held)."""
+    global _cached_credentials
     try:
         refresh_credentials_if_needed(credentials)
     except Exception as exc:
@@ -266,6 +315,9 @@ def load_credentials() -> Credentials:
             "usable. Replace the file by completing the OAuth flow again "
             "via GET /auth/google/authorize."
         )
+    # Re-read the key: a successful refresh may have rewritten the file.
+    key = _token_file_key()
+    _cached_credentials = (key, credentials) if key is not None else None
     return credentials
 
 
@@ -441,6 +493,7 @@ def logout() -> dict[str, Any]:
     global _current_state, _current_flow
     _current_state = None
     _current_flow = None
+    clear_credentials_cache()
     existed = GOOGLE_TOKEN_FILE.exists()
     if existed:
         try:

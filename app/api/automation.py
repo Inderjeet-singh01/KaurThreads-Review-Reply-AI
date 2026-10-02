@@ -1,15 +1,16 @@
-"""Automation endpoints: status, bulk backfill, and a development test trigger."""
+"""Automation endpoints: status, bulk backfill, reconciliation, and a development test trigger."""
 
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from app.api.reviews import _to_http_error
 from app.auth.google_oauth import GoogleOAuthError
-from app.automation import backfill
+from app.automation import backfill, reconcile
 from app.automation.processor import MAX_PROCESSING_ATTEMPTS, process_new_review
 from app.config import settings
 from app.google.client import GoogleAPIError
@@ -31,7 +32,96 @@ def automation_status() -> dict[str, Any]:
         "webhook_auth_configured": pubsub_auth_configured(),
         "test_endpoint_enabled": settings.automation_test_endpoint_enabled,
         "backfill_delay_seconds": settings.automation_backfill_delay_seconds,
+        "verify_after_publish": settings.auto_reply_verify_after_publish,
+        "reconciliation_enabled": settings.reconciliation_enabled,
+        "reconciliation_auth_configured": settings.reconciliation_auth_configured,
+        "reconciliation_max_reviews": settings.reconciliation_max_reviews,
+        "reconciliation_lookback_minutes": settings.reconciliation_lookback_minutes,
+        "last_reconciliation": (
+            job.summary(include_items=False) if (job := reconcile.latest_job()) else None
+        ),
     }
+
+
+# --- Reconciliation (scheduled safety net) -------------------------------------------
+def require_reconcile_secret(
+    authorization: str | None = Header(None),
+    x_reconcile_secret: str | None = Header(None),
+) -> None:
+    """Shared-secret check for the reconciliation endpoints (scheduler only).
+
+    Accepts ``Authorization: Bearer <RECONCILIATION_SECRET>`` or
+    ``X-Reconcile-Secret: <RECONCILIATION_SECRET>``. Closed (503) until a
+    secret of at least 16 characters is configured. The secret is compared
+    in constant time and never logged or echoed.
+    """
+    if not settings.reconciliation_auth_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Reconciliation is not configured (set RECONCILIATION_SECRET, 16+ characters).",
+        )
+    provided = (x_reconcile_secret or "").strip()
+    if not provided:
+        scheme, _, token = (authorization or "").partition(" ")
+        provided = token.strip() if scheme.lower() == "bearer" else ""
+    if not provided:
+        raise HTTPException(status_code=401, detail="Missing reconciliation secret.")
+    expected = settings.reconciliation_secret.strip()
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="Invalid reconciliation secret.")
+
+
+@router.post("/reconcile", dependencies=[Depends(require_reconcile_secret)])
+async def start_reconciliation(
+    location_id: str | None = Query(
+        None, description="Business Profile location id. Defaults to the configured / first location."
+    ),
+    trigger: str = Query("scheduler", max_length=32, pattern=r"^[A-Za-z0-9_\-]+$"),
+    wait: bool = Query(False, description="Wait (up to wait_timeout seconds) for the job to finish."),
+    wait_timeout: float = Query(240, ge=1, le=900),
+) -> JSONResponse:
+    """Process recent unanswered reviews that Pub/Sub did not (yet) handle.
+
+    Meant to be called by an external scheduler every few minutes (see
+    README 13.11). Each review goes through the same ``process_new_review()``
+    as the webhook. Returns ``202`` with the job while it runs (``200`` when
+    nothing needed processing, or with ``wait=true``); ``409`` when a
+    reconciliation or backfill is already running or automation is off.
+    """
+    try:
+        job = await reconcile.start_reconciliation(location_id, trigger)
+        if wait and job.active:
+            job = await reconcile.wait_for_job(job.job_id, wait_timeout) or job
+    except reconcile.ReconcileRejected as exc:
+        return JSONResponse(
+            {"started": False, "reason": exc.reason, "job_id": exc.job_id},
+            status_code=exc.status_code,
+        )
+    except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
+        raise _to_http_error(exc) from exc
+    content = {"started": bool(job.items), **job.summary()}
+    if not job.items:
+        content["reason"] = "There are no recent unanswered reviews to reconcile."
+    return JSONResponse(content, status_code=202 if job.active else 200)
+
+
+@router.get("/reconcile", dependencies=[Depends(require_reconcile_secret)])
+def latest_reconciliation() -> dict[str, Any]:
+    """The running reconciliation, else the most recent one (``job`` is null if none)."""
+    job = reconcile.latest_job()
+    return {"job": job.summary() if job else None}
+
+
+@router.get("/reconcile/{job_id}", dependencies=[Depends(require_reconcile_secret)])
+def reconciliation_status(job_id: str) -> dict[str, Any]:
+    """Progress of one reconciliation job (no reply text, no secrets)."""
+    job = reconcile.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found. It may have finished before a server restart.",
+        )
+    return job.summary()
 
 
 # --- Bulk backfill ----------------------------------------------------------------
@@ -118,5 +208,5 @@ async def automation_test(
     """
     if not settings.automation_test_endpoint_enabled:
         raise HTTPException(status_code=404, detail="Not Found")
-    run = await process_new_review(review_id, location_id, allow_rerun=True)
+    run = await process_new_review(review_id, location_id, allow_rerun=True, trigger="test")
     return run.summary()

@@ -81,6 +81,7 @@ _SKIPPED_STATUSES = {
     AutomationStatus.DUPLICATE,
     AutomationStatus.IGNORED,
     AutomationStatus.DISABLED,
+    AutomationStatus.SKIPPED_NO_UNANSWERED_REVIEW,
 }
 
 
@@ -226,6 +227,12 @@ def get_job(job_id: str) -> BackfillJob | None:
     return _jobs.get(job_id)
 
 
+def active_job() -> BackfillJob | None:
+    """The running backfill job, if any (reconciliation defers to it)."""
+    job = _jobs.get(_active_job_id) if _active_job_id else None
+    return job if job is not None and job.active else None
+
+
 def latest_job(location_id: str | None = None) -> BackfillJob | None:
     """The running job, else the most recent one (optionally per location)."""
     if _active_job_id and (job := _jobs.get(_active_job_id)):
@@ -343,7 +350,7 @@ async def _process_item(job: BackfillJob, item: BackfillItem) -> None:
     forget_review(item.review_id)
     for attempt in range(1, MAX_PROCESSING_ATTEMPTS + 1):
         item.attempts = attempt
-        run = await process_new_review(item.review_id, job.location_id)
+        run = await process_new_review(item.review_id, job.location_id, trigger="backfill")
         item.record(run)
         if not run.retryable or attempt == MAX_PROCESSING_ATTEMPTS or job.cancel_event.is_set():
             break

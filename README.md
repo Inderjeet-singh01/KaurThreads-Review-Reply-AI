@@ -92,7 +92,10 @@ google-review-reply/
 │   │   ├── reviews.py           # GET /reviews, POST .../generate, .../validate, .../publish
 │   │   └── automation.py        # GET /automation/status, dev-only POST /automation/test/{id}
 │   ├── automation/
-│   │   └── processor.py         # automatic workflow: process_new_review()
+│   │   ├── processor.py         # automatic workflow: process_new_review() (shared by every trigger)
+│   │   ├── resolver.py          # NEW_REVIEW → exact review, or fallback resolution from Google
+│   │   ├── reconcile.py         # scheduled safety net: POST /automation/reconcile
+│   │   └── backfill.py          # bulk "reply to all pending reviews"
 │   ├── webhooks/
 │   │   ├── google_reviews.py    # POST /webhooks/google-reviews (Pub/Sub push)
 │   │   └── pubsub.py            # push JWT verification + notification decoding
@@ -100,7 +103,8 @@ google-review-reply/
 │   │   └── google_oauth.py      # OAuth 2.0 only (authorize, callback, token file) + auth endpoints
 │   ├── google/
 │   │   ├── client.py            # authenticated Business Profile REST client
-│   │   └── reviews.py           # review fetching/filtering/final check/publish
+│   │   ├── reviews.py           # review fetching/filtering/final check/publish
+│   │   └── resource_names.py    # tolerant review/location resource-name parsing
 │   ├── ai/
 │   │   ├── prompts.py           # shared reply-generation prompt (single source of truth)
 │   │   ├── groq_client.py       # Groq integration (primary provider)
@@ -428,7 +432,11 @@ New Google review
   → Cloud Pub/Sub topic
   → authenticated HTTPS push → POST /webhooks/google-reviews
   → verify Pub/Sub JWT (signature, issuer, audience, service account, expiry)
-  → decode notification → review resource name (the event is only a trigger)
+  → decode notification (tolerant: field aliases, URL-encoding, slashes,
+    full/short/bare review ids — see 13.12); the event is only a trigger
+  → review reference usable? → that exact review (Google 404 → SKIPPED_NOT_FOUND)
+    missing / unparseable → FALLBACK_RESOLUTION:
+    newest unanswered review of the notified location (13.12)
   → AUTO_REPLY_ENABLED? no → DISABLED (acknowledged, nothing else happens)
   → fetch the review from Google (source of truth)
   → already replied? yes → SKIPPED_ALREADY_REPLIED (no AI call)
@@ -440,7 +448,12 @@ New Google review
   → final Google check: replied meanwhile? → SKIPPED_ALREADY_REPLIED
   → AUTO_REPLY_DRY_RUN? yes → DRY_RUN (logs WOULD_PUBLISH + the reply)
   → publish_reply() (same function as Post Reply) → PUBLISHED
+  → verification read: Google shows the reply? (logged as verified=…)
 ```
+
+The scheduled reconciliation (13.11) and the bulk backfill (13.10) feed
+reviews into the very same `process_new_review()`; there is only one
+reply pipeline.
 
 A reply is published only when **all** of these hold: `AUTO_REPLY_ENABLED`
 is true, dry run is off, the review was unanswered, generation succeeded, the
@@ -462,15 +475,19 @@ automation reuses it unchanged.
 
 | Outcome | HTTP | Pub/Sub |
 | --- | --- | --- |
-| `PUBLISHED`, `DRY_RUN`, `SKIPPED_ALREADY_REPLIED`, `FAILED_VALIDATION`, `DISABLED`, `IGNORED` (other notification types / location not allowlisted), `SKIPPED_NOT_FOUND`, recently-finished `DUPLICATE` | 200 | acknowledged |
-| Same review already being processed (`DUPLICATE`) | 409 | redelivered later |
-| Transient Google/AI failure (`ERROR`, `FAILED_GENERATION`) | 503 | redelivered |
-| Undecodable message | 400 | redelivered → dead-letter topic |
+| `PUBLISHED`, `DRY_RUN`, `SKIPPED_ALREADY_REPLIED`, `FAILED_VALIDATION`, `DISABLED`, `IGNORED` (other notification types / location not allowlisted), `SKIPPED_NOT_FOUND`, `SKIPPED_NO_UNANSWERED_REVIEW` (fallback found nothing to do), recently-finished `DUPLICATE` | 200 | acknowledged |
+| Same review (or same fallback message) already being processed (`DUPLICATE`) | 409 | redelivered later |
+| Transient Google/AI failure (`ERROR`, `FAILED_GENERATION`), incl. a failed fallback listing | 503 | redelivered |
+| Undecodable message, or NEW_REVIEW with **no valid location** / location contradicting the review | 400 | redelivered → dead-letter topic |
 | Missing / invalid JWT | 401 / 403 | redelivered (fix the configuration) |
 
-Retries are bounded twice: the subscription's dead-letter policy (below), and
-in the app, which acknowledges a review after **3** retryable failures and
-logs "manual review needed".
+A NEW_REVIEW whose review value has an unexpected format is **not** a 400
+any more as long as its location is valid: it is resolved from Google
+(13.12). Retries are bounded twice: the subscription's dead-letter policy
+(below), and in the app, which acknowledges a review after **3** retryable
+failures and logs "manual review needed" (a fallback message whose Google
+listing keeps failing is likewise acknowledged after 3 attempts — the
+reconciliation then picks the review up).
 
 ### 13.3 Duplicate handling
 
@@ -482,7 +499,17 @@ Pub/Sub can deliver a message more than once. Inside the process:
    `DRY_RUN` or an exhausted retry budget is acknowledged without new AI calls;
 3. the **mandatory** Google check: a redelivery after `PUBLISHED` fetches the
    review, sees the reply and stops; the final check before publishing
-   catches replies made by anyone while the AI was working.
+   catches replies made by anyone while the AI was working;
+4. fallback messages are remembered by Pub/Sub message id (24 h): a
+   redelivered fallback notification is acknowledged as `DUPLICATE` instead
+   of picking the *next* unanswered review.
+
+The webhook, the reconciliation and the bulk backfill share the per-review
+lock and outcome memory, so they never process the same review at the same
+time; the fallback resolver and the reconciliation skip reviews that are in
+progress or recently settled before choosing what to process. Google's
+`reviewReply` (read at the start and immediately before publishing) is the
+final authority — the in-memory state only saves AI calls.
 
 **Run the backend as one process.** The lock and memory live in memory.
 Use a single Render instance and a single uvicorn worker (the default:
@@ -603,6 +630,11 @@ Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
 | `AUTOMATION_TEST_ENDPOINT_ENABLED` | `false` in production |
 | `AUTOMATION_BACKFILL_DELAY_SECONDS` | optional, default `2` |
 | `AUTOMATION_BACKFILL_RETRY_DELAY_SECONDS` | optional, default `15` |
+| `AUTO_REPLY_VERIFY_AFTER_PUBLISH` | optional, default `true` (re-read the review after publishing) |
+| `RECONCILIATION_ENABLED` | optional, default `true` |
+| `RECONCILIATION_SECRET` | **required for reconciliation** (16+ chars; `python -c "import secrets; print(secrets.token_urlsafe(32))"`) |
+| `RECONCILIATION_MAX_REVIEWS` | optional, default `10` per run |
+| `RECONCILIATION_LOOKBACK_MINUTES` | optional, default `10080` (7 days); also bounds the webhook fallback; `0` = no limit |
 
 The webhook rejects every request while either `PUBSUB_PUSH_*` value is
 empty. The JWT is never logged.
@@ -639,6 +671,13 @@ empty. The JWT is never logged.
   key name on *this* service and redeploy. `credential_type:
   "oauth_client_config"` means the client secret JSON from Cloud Console
   was uploaded instead of the OAuth token file.
+- **Expired access tokens are normal.** Access tokens last about an hour;
+  the app refreshes them with the stored refresh token and keeps the
+  refreshed credentials in memory until they expire again (one refresh per
+  hour, not one per Google call). With a read-only Secret File the log line
+  "Refreshed Google access token could not be written … continuing with the
+  in-memory token" is expected and harmless. Re-authentication is only
+  needed when the *refresh* token is revoked or expired.
 - **Refresh tokens must not expire:** while the OAuth consent screen's
   publishing status is **Testing**, Google expires refresh tokens after
   7 days. Set it to **In production** for unattended use.
@@ -662,10 +701,11 @@ empty. The JWT is never logged.
    real **unanswered** review id: logs show `WOULD_PUBLISH` with the reply.
    Then wait for a real new review and check its logs. Google documents the
    notification's fields only informally (`reviewName` / `locationName`), so
-   the decoder accepts `type`/`notificationType`, `review`/`reviewName` and
-   `location`/`locationName`. A real notification it cannot read is logged as
-   "Pub/Sub push rejected … payload keys: [...]" and ends in the dead-letter
-   topic.
+   the decoder accepts the aliases and shapes in 13.12. A notification whose
+   review value it cannot read is resolved from Google
+   (`FALLBACK_RESOLUTION`); only a notification without any valid location
+   is rejected (`WEBHOOK_REJECTED … Pub/Sub push rejected: …`, with the
+   sanitized raw values) and ends in the dead-letter topic.
 4. When dry runs look right, set `AUTO_REPLY_DRY_RUN=false`.
 
 **Local development:** set `AUTOMATION_TEST_ENDPOINT_ENABLED=true` (with
@@ -690,9 +730,13 @@ logged.
 
 ### 13.9 Limitations
 
-- Only `NEW_REVIEW` triggers real-time automation. Reviews that arrived
-  while it was disabled are not processed automatically; answer them
-  manually or with the bulk reply (13.10).
+- Only `NEW_REVIEW` triggers real-time automation. The reconciliation
+  (13.11) catches reviews inside `RECONCILIATION_LOOKBACK_MINUTES` whose
+  notification was late, lost or unusable; older reviews (e.g. from before
+  automation was enabled) need a manual reply or the bulk reply (13.10).
+- A review that ends in `FAILED_VALIDATION` or exhausts its retry budget is
+  not retried by the reconciliation for 24 h (in-process memory; a restart
+  clears it), so a broken AI provider cannot burn quota every few minutes.
 - Location resolution uses the first Business Profile account (as the rest
   of the app does). Events for locations in other accounts fail and are
   acknowledged after the retry budget.
@@ -763,3 +807,119 @@ POST /automation/backfill/{job_id}/cancel       stop after the current review
 that the logs show `WOULD_PUBLISH` for the reviews you expect. Then set
 `AUTO_REPLY_DRY_RUN=false`, deploy (this also clears the in-memory
 "recently dry-run" memory), and run it once.
+
+### 13.11 Reconciliation (scheduled safety net)
+
+Pub/Sub is the real-time path; reconciliation makes sure a review is not
+left unanswered when a notification is delayed (Render asleep/restarting),
+dropped after its retries, or unusable. It is **one bounded job per call**
+— there is no background loop in the web process, so it works on a
+stateless, restartable Render service. An external scheduler calls it.
+
+```
+POST /automation/reconcile[?location_id=…][&wait=true]   start (202) / result (200 with wait=true)
+GET  /automation/reconcile                               running job, else the most recent one
+GET  /automation/reconcile/{job_id}                      one job (no reply text, no secrets)
+```
+
+All three need `Authorization: Bearer <RECONCILIATION_SECRET>` (or
+`X-Reconcile-Secret: <secret>`): `503` while no secret (16+ chars) is
+configured, `401` without one, `403` for a wrong one (constant-time
+comparison; the secret is never logged). `GET /automation/status` also
+shows `reconciliation_*` settings and a `last_reconciliation` summary
+(counts and timestamps only).
+
+What one run does:
+
+1. rejected (`409`) when `RECONCILIATION_ENABLED=false`,
+   `AUTO_REPLY_ENABLED=false`, another reconciliation is running (the
+   response names its `job_id`), or a bulk backfill is running (it already
+   covers every pending review); `403` for a location outside
+   `AUTO_REPLY_LOCATION_IDS`;
+2. lists the location's reviews from Google and keeps the **unanswered**
+   ones created/updated within `RECONCILIATION_LOOKBACK_MINUTES`, newest
+   first;
+3. skips reviews another run is processing right now or that recently
+   ended as `FAILED_VALIDATION` / `DRY_RUN` / exhausted retries;
+4. processes at most `RECONCILIATION_MAX_REVIEWS`, one at a time, each with
+   `process_new_review(trigger="reconcile")` — dry run, allowlist, one
+   regeneration, retry budget, per-review lock and both Google checks all
+   apply. A failure is recorded and the job continues; the rest
+   (`deferred`) is handled by the next call.
+
+**Scheduling** (pick one; every 10 minutes is plenty):
+
+- **Google Cloud Scheduler** (same project as Pub/Sub; free tier covers it):
+  ```bash
+  gcloud services enable cloudscheduler.googleapis.com --project=PROJECT_ID
+  gcloud scheduler jobs create http gbp-reviews-reconcile --project=PROJECT_ID \
+    --location=us-central1 --schedule="*/10 * * * *" --http-method=POST \
+    --uri="https://YOUR-RENDER-BACKEND-DOMAIN/automation/reconcile?trigger=cloud_scheduler" \
+    --headers="X-Reconcile-Secret=YOUR_RECONCILIATION_SECRET" \
+    --attempt-deadline=60s
+  gcloud scheduler jobs run gbp-reviews-reconcile --project=PROJECT_ID --location=us-central1  # test now
+  ```
+- **Render Cron Job** (separate Render service, any small image with curl):
+  command `curl -fsS -X POST -H "X-Reconcile-Secret: $RECONCILIATION_SECRET" "https://YOUR-RENDER-BACKEND-DOMAIN/automation/reconcile?trigger=render_cron"`,
+  schedule `*/10 * * * *`, and `RECONCILIATION_SECRET` set on the cron service.
+- **GitHub Actions** (`on: schedule: - cron: "*/10 * * * *"`) or
+  **cron-job.org**: the same `curl` with the secret stored as a repository
+  / job secret. GitHub's schedule can lag by several minutes, which is fine
+  for a safety net.
+
+A scheduled call also wakes a sleeping free-plan instance, after which any
+pending Pub/Sub retries succeed too. Treat `409` ("already running") as
+success in the scheduler. Logs: `RECONCILE_STARTED job=… trigger=…
+unanswered_recent=… selected=… in_progress=… recently_settled=…
+deferred=…`, one `RECONCILE job=… review=… run=… outcome=…` per review,
+and `RECONCILE_COMPLETED job=… published=… would_publish=… failed=…`.
+
+### 13.12 Notification parsing, fallback resolution, and tracing a review
+
+**Accepted notification shapes.** Field names (case-insensitive):
+`type` / `notificationType` / `notification_type`, `review` / `reviewName` /
+`review_name`, `location` / `locationName` / `location_name`; the type may
+also come from the Pub/Sub message attributes, and an unwrapped
+(`--push-no-wrapper`) body is accepted. Values are trimmed, URL-decoded (up
+to twice), stripped of an API URL prefix (`https://mybusiness.googleapis.com/v4/…`)
+and of leading/trailing slashes; a review may also be an object with a
+`name`. Review references may be
+`accounts/{a}/locations/{l}/reviews/{r}`, `locations/{l}/reviews/{r}`,
+`reviews/{r}` or a bare `{r}` (the last two need a valid `location`).
+Every id segment must be a plain id (`A-Z a-z 0-9 - _ . ~ = +`, no empty or
+`..` segments), so traversal or junk never reaches a Google URL. A location
+or account that contradicts the review resource name is rejected (400).
+
+**Fallback resolution.** When a NEW_REVIEW has a valid location but its
+review reference is missing or unparseable, the webhook does not fail. It lists the location's reviews,
+keeps unanswered ones inside `RECONCILIATION_LOOKBACK_MINUTES`, orders them
+deterministically (creation time, update time, review id — newest first),
+skips reviews in progress or recently settled, and processes **only the
+newest one** through `process_new_review()`. Nothing left →
+`SKIPPED_NO_UNANSWERED_REVIEW` (200). A *well-formed* review id that Google
+does not know (404) is acknowledged as `SKIPPED_NOT_FOUND` and never falls
+back — so a synthetic test push can never trigger a reply to a different
+real review; if a real review was behind it, the reconciliation answers it.
+Several new reviews with unusable
+notifications are handled one per notification (each picks the next
+newest), and the reconciliation catches any remainder.
+
+**What happened to review X?** Search the Render logs for these lines (all
+carry ids; none carry tokens, secrets or headers):
+
+```
+WEBHOOK_RECEIVED message_id=… delivery_attempt=… event=NEW_REVIEW location_raw=… review_raw=…
+                 normalized_location=… normalized_review=… review_id=… stage=PARSED|FALLBACK_RESOLUTION
+automation run=… review=… location=… trigger=webhook status=FALLBACK_RESOLUTION reason=…   (fallback only)
+automation message=… FALLBACK_RESOLUTION chose review=X created=… (newest of N free candidates)
+automation run=… review=X … status=RECEIVED|FETCHING_REVIEW|PROCESSING google_reply=none|
+                 GENERATING|GENERATED provider=groq|VALIDATING|PASSED|FINAL_CHECK|PUBLISHING|PUBLISHED verified=True
+automation_run {"run_id": …, "review_id": "X", "trigger": …, "message_id": …, "resolution": …, "final_status": …}
+WEBHOOK_RESULT message_id=… review_id=X run_id=… resolution=… final_status=… http_status=… error_type=…
+RECONCILE job=… review=X run=… outcome=… final_status=…                               (reconciliation)
+```
+
+`grep "review=X"` (or the `run_id`) shows every attempt from every trigger.
+A rejected message logs `WEBHOOK_REJECTED message_id=… stage=PARSING
+error_type=malformed Pub/Sub push rejected: <reason with sanitized raw values>`.
+

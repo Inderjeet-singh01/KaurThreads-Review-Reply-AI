@@ -131,8 +131,9 @@ class BackfillFlowTests(BackfillTestCase):
         self.get_review.side_effect = slow_get_review
         await self.run_backfill()
         self.assertEqual(peak, 1)
-        # Each review: initial fetch then final check, before the next review starts.
-        self.assertEqual(order, ["a", "a", "b", "b", "c", "c", "d", "d"])
+        # Each review: initial fetch, final check and post-publish verification,
+        # before the next review starts.
+        self.assertEqual(order, [rid for rid in "abcd" for _ in range(3)])
 
     # 4
     async def test_review_replied_since_listing_is_skipped(self):

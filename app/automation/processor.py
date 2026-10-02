@@ -33,7 +33,14 @@ Flow (hard upper bounds, no loops)::
       │
     AUTO_REPLY_DRY_RUN? ── yes ──> DRY_RUN (WOULD_PUBLISH, nothing sent)
       │
-    publish_reply ──> PUBLISHED
+    publish_reply ──> PUBLISHED (only after Google accepted the reply)
+      │
+    verification read (AUTO_REPLY_VERIFY_AFTER_PUBLISH) → publish_verified
+
+Every trigger uses this one function: the Pub/Sub webhook (directly or via
+the fallback resolver in :mod:`app.automation.resolver`), the scheduled
+reconciliation (:mod:`app.automation.reconcile`), the bulk backfill
+(:mod:`app.automation.backfill`) and the development test endpoint.
 
 A validator *infrastructure* error (timeout, quota, bad provider response)
 is not a FAIL verdict: it stops the run as a retryable ERROR without
@@ -45,7 +52,8 @@ for a review that is already being processed, recent terminal outcomes
 redelivered event does not spend AI calls again, and retryable failures are
 capped per review. None of this replaces the final Google check, which runs
 immediately before every publish. This state lives in one process: run the
-backend as a single worker / single instance (see README).
+backend as a single worker / single instance (see README). Google's
+``reviewReply`` state, read twice per run, stays the final authority.
 """
 
 from __future__ import annotations
@@ -93,6 +101,7 @@ _MAX_LOGGED_REPLY_CHARS = 600
 class AutomationStatus(str, Enum):
     RECEIVED = "RECEIVED"
     PROCESSING = "PROCESSING"
+    FETCHING_REVIEW = "FETCHING_REVIEW"
     SKIPPED_ALREADY_REPLIED = "SKIPPED_ALREADY_REPLIED"
     GENERATING = "GENERATING"
     GENERATED = "GENERATED"
@@ -112,6 +121,9 @@ class AutomationStatus(str, Enum):
     IGNORED = "IGNORED"  # not a NEW_REVIEW event, or location not allowlisted
     DUPLICATE = "DUPLICATE"  # same review in progress / recently finished
     SKIPPED_NOT_FOUND = "SKIPPED_NOT_FOUND"  # review deleted on Google
+    # Webhook fallback resolution (review reference missing / unparseable):
+    FALLBACK_RESOLUTION = "FALLBACK_RESOLUTION"
+    SKIPPED_NO_UNANSWERED_REVIEW = "SKIPPED_NO_UNANSWERED_REVIEW"
 
 
 @dataclass
@@ -136,6 +148,14 @@ class AutomationRun:
     reply: str | None = None
     error_stage: str | None = None
     error: str | None = None
+    # Tracing: who triggered the run and how the review was identified.
+    trigger: str = "webhook"  # webhook | reconcile | backfill | test
+    message_id: str | None = None  # Pub/Sub message id, when there is one
+    resolution: str = "exact"  # exact | fallback
+    fallback_reason: str | None = None
+    # Post-publish read: True = Google shows the reply, False = not (yet)
+    # visible, None = not checked / check failed.
+    publish_verified: bool | None = None
 
     @property
     def published(self) -> bool:
@@ -150,6 +170,10 @@ class AutomationRun:
             "review_id": self.review_id,
             "location_id": self.location_id,
             "event_type": self.event_type,
+            "trigger": self.trigger,
+            "message_id": self.message_id,
+            "resolution": self.resolution,
+            "fallback_reason": self.fallback_reason,
             "final_status": self.status.value,
             "retryable": self.retryable,
             "generation_provider": self.generation_provider,
@@ -159,6 +183,7 @@ class AutomationRun:
             "validation_reasons": self.validation_reasons,
             "publish_result": self.publish_result,
             "published": self.published,
+            "publish_verified": self.publish_verified,
             "reply": reply,
             "error_stage": self.error_stage,
             "error": self.error,
@@ -199,6 +224,21 @@ def forget_review(review_id: str) -> None:
     _retryable_failures.pop(review_id, None)
 
 
+def review_activity(review_id: str) -> str | None:
+    """``"in_progress"``, ``"recently_settled"`` or ``None`` (free to process).
+
+    Lets the fallback resolver and the reconciliation skip reviews another
+    run is handling, or that recently ended in a remembered outcome, before
+    choosing what to process — without spending any Google or AI call.
+    """
+    lock = _locks.get(review_id)
+    if lock is not None and lock.locked():
+        return "in_progress"
+    if _recent_outcome(review_id) is not None:
+        return "recently_settled"
+    return None
+
+
 def _recent_outcome(review_id: str) -> AutomationStatus | None:
     entry = _recent_outcomes.get(review_id)
     if entry is None:
@@ -221,8 +261,8 @@ def _remember_outcome(review_id: str, status: AutomationStatus) -> None:
 def _set_status(run: AutomationRun, status: AutomationStatus, detail: str = "") -> None:
     run.status = status
     logger.info(
-        "automation run=%s review=%s location=%s status=%s%s",
-        run.run_id, run.review_id, run.location_id, status.value,
+        "automation run=%s review=%s location=%s trigger=%s status=%s%s",
+        run.run_id, run.review_id or "-", run.location_id, run.trigger, status.value,
         f" {detail}" if detail else "",
     )
 
@@ -277,12 +317,14 @@ def _run_pipeline(run: AutomationRun) -> AutomationRun:
     _set_status(run, AutomationStatus.PROCESSING)
 
     # 1. Authoritative review from Google + first "already replied" check.
+    _set_status(run, AutomationStatus.FETCHING_REVIEW)
     raw_review = _fetch_review(run, "fetch")
     if raw_review is None:
         return run
     if has_reply(raw_review):
         _set_status(run, AutomationStatus.SKIPPED_ALREADY_REPLIED, "stage=initial_check")
         return run
+    _set_status(run, AutomationStatus.PROCESSING, "google_reply=none")
     review = normalize_review(raw_review)
 
     # 2. Initial generation (Groq → Gemini fallback inside the generator).
@@ -379,9 +421,38 @@ def _run_pipeline(run: AutomationRun) -> AutomationRun:
         # On a retry, the final check detects a reply that Google stored
         # despite a failed response, so redelivery cannot double-publish.
         return _stop_with_error(run, "publish", exc, retryable=_is_retryable_google_error(exc))
+    # Google accepted the reply (2xx): only now is the run PUBLISHED.
     run.publish_result = "published"
-    _set_status(run, AutomationStatus.PUBLISHED)
+    _verify_published(run)
+    _set_status(run, AutomationStatus.PUBLISHED, f"verified={run.publish_verified}")
     return run
+
+
+def _verify_published(run: AutomationRun) -> None:
+    """Re-read the review once and record whether Google shows the reply.
+
+    Purely observational: the publish already succeeded, so a failed or
+    negative check is logged but never turns the run into a failure (a
+    retry could only be stopped by the next run's Google checks anyway).
+    """
+    if not settings.auto_reply_verify_after_publish:
+        return
+    try:
+        raw_review = get_review(run.review_id, location_id=run.location_id)
+    except (GoogleReviewError, GoogleOAuthError, GoogleAPIError) as exc:
+        logger.warning(
+            "automation run=%s review=%s publish verification read failed (%s); "
+            "Google accepted the reply",
+            run.run_id, run.review_id, type(exc).__name__,
+        )
+        return
+    run.publish_verified = has_reply(raw_review)
+    if not run.publish_verified:
+        logger.warning(
+            "automation run=%s review=%s Google accepted the reply but does not "
+            "show it yet (it may still be propagating or under moderation)",
+            run.run_id, run.review_id,
+        )
 
 
 # --- Entry point --------------------------------------------------------------------
@@ -393,11 +464,18 @@ async def process_new_review(
     event_type: str = NEW_REVIEW_EVENT,
     delivery_attempt: int | None = None,
     allow_rerun: bool = False,
+    trigger: str = "webhook",
+    message_id: str | None = None,
+    resolution: str = "exact",
+    fallback_reason: str | None = None,
 ) -> AutomationRun:
     """Run the automatic reply workflow for one review.
 
-    Used by the Pub/Sub webhook, the bulk backfill
-    (:mod:`app.automation.backfill`) and the development test endpoint alike.
+    Used by the Pub/Sub webhook (exact and fallback resolution), the
+    scheduled reconciliation (:mod:`app.automation.reconcile`), the bulk
+    backfill (:mod:`app.automation.backfill`) and the development test
+    endpoint alike. ``trigger`` / ``message_id`` / ``resolution`` /
+    ``fallback_reason`` only label the run for logs and status APIs.
     ``delivery_attempt`` is Pub/Sub's counter (present when a dead-letter
     policy is configured). ``allow_rerun`` skips only the "recently
     finished" duplicate memory (development test endpoint); every safety
@@ -411,10 +489,15 @@ async def process_new_review(
         location_id=location_id,
         event_type=event_type,
         review_resource_name=review_resource_name,
+        trigger=trigger,
+        message_id=message_id,
+        resolution=resolution,
+        fallback_reason=fallback_reason,
     )
     _set_status(
         run, AutomationStatus.RECEIVED,
-        f"event={event_type} resource={review_resource_name} delivery_attempt={delivery_attempt}",
+        f"event={event_type} resource={review_resource_name} message={message_id} "
+        f"resolution={resolution} delivery_attempt={delivery_attempt}",
     )
 
     if event_type != NEW_REVIEW_EVENT:
