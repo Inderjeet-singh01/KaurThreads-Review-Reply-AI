@@ -15,12 +15,8 @@ import asyncio
 import base64
 import datetime
 import json
-import os
-import stat
-import tempfile
 import threading
 import unittest
-from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
@@ -31,7 +27,7 @@ from google.oauth2.credentials import Credentials
 from app.ai.gemini_client import GeminiError
 from app.ai.groq_client import GroqError
 from app.api import automation as automation_api
-from app.auth import google_oauth
+from app.auth import google_oauth, token_store
 from app.automation import backfill, reconcile, resolver
 from app.automation.processor import AutomationStatus
 from app.google.client import GoogleAPIError
@@ -43,6 +39,7 @@ from app.google.resource_names import (
 from app.google.reviews import LocationNotFoundError, ReviewNotFoundError
 from app.webhooks import google_reviews as webhook
 from app.webhooks.pubsub import MalformedPushError, parse_push_body
+from tests.postgres import TEST_CLIENT_ID, DatabaseTestCase
 from tests.test_automation import (
     _GOOGLE_CERTS,
     FAIL,
@@ -740,27 +737,19 @@ class ReconciliationTests(ResilienceTestCase):
         self.assertEqual(self.reconcile_post(wait="true").json()["published"], 1)
 
 
-# --- 22: expired access token, read-only token file -------------------------------------
-class ExpiredTokenTests(unittest.TestCase):
+# --- 22: expired access token, database-backed credentials ------------------------------
+class ExpiredTokenTests(DatabaseTestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.path = Path(tmp.name) / "google_token.json"
+        super().setUp()
         expired = (datetime.datetime.now(datetime.timezone.utc)
                    - datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.path.write_text(json.dumps({
+        self.info = {
             "token": "stale-access", "refresh_token": "refresh-1",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "client_id": "123-abc.apps.googleusercontent.com", "client_secret": "x",
+            "client_id": TEST_CLIENT_ID,
             "scopes": [google_oauth.GOOGLE_SCOPE_BUSINESS_MANAGE], "expiry": expired,
-        }))
-        os.chmod(self.path, stat.S_IRUSR)  # read-only, like a Render Secret File
-        self.addCleanup(lambda: self.path.exists() and os.chmod(self.path, 0o600))
-        patcher = mock.patch.object(google_oauth, "GOOGLE_TOKEN_FILE", self.path)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        google_oauth.clear_credentials_cache()
-        self.addCleanup(google_oauth.clear_credentials_cache)
+        }
+        token_store.save(self.info)
         self.refreshes = 0
 
     def fake_refresh(self, credentials, request):
@@ -770,31 +759,30 @@ class ExpiredTokenTests(unittest.TestCase):
                               + datetime.timedelta(hours=1)).replace(tzinfo=None)
 
     def test_expired_token_is_refreshed_once_and_reused_in_memory(self):
-        if os.access(self.path, os.W_OK):
-            self.skipTest("running as a user that can write read-only files")
         with mock.patch.object(Credentials, "refresh", autospec=True, side_effect=self.fake_refresh), \
-                self.assertLogs("app.auth.google_oauth", level="WARNING") as logs:
+                self.assertLogs("app.auth.google_oauth", level="INFO") as logs:
             tokens = [google_oauth.load_credentials().token for _ in range(3)]
         self.assertEqual(tokens, ["fresh-access-1"] * 3)
         self.assertEqual(self.refreshes, 1)  # not once per Google call
-        self.assertEqual(sum("could not be written" in line for line in logs.output), 1)
+        self.assertEqual(sum("saved to the database" in line for line in logs.output), 1)
         self.assertFalse(any("refresh-1" in line for line in logs.output))
 
-    def test_new_token_file_replaces_the_cached_credentials(self):
+    def test_new_stored_credentials_replace_the_cached_ones(self):
         with mock.patch.object(Credentials, "refresh", autospec=True, side_effect=self.fake_refresh):
             google_oauth.load_credentials()
-            os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
-            data = json.loads(self.path.read_text())
-            data.update(token="uploaded-access", expiry="2099-01-01T00:00:00Z")
-            self.path.write_text(json.dumps(data))
-            self.assertEqual(google_oauth.load_credentials().token, "uploaded-access")
-        self.path.unlink()
+            token_store.save({**self.info, "token": "reauthorized-access",
+                              "expiry": "2099-01-01T00:00:00Z"})
+            google_oauth._cache.checked_at = float("-inf")  # recheck interval elapsed
+            self.assertEqual(google_oauth.load_credentials().token, "reauthorized-access")
+        token_store.delete()
+        google_oauth._cache.checked_at = float("-inf")
         with self.assertRaises(google_oauth.GoogleOAuthError):
             google_oauth.load_credentials()
 
     def test_refresh_failure_is_an_oauth_error_not_a_crash(self):
         with mock.patch.object(Credentials, "refresh", autospec=True,
                                side_effect=RuntimeError("invalid_grant")), \
+                self.assertLogs("app.auth.google_oauth", level="ERROR"), \
                 self.assertRaises(google_oauth.GoogleOAuthError):
             google_oauth.load_credentials()
 

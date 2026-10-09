@@ -1,9 +1,9 @@
 """Authenticated Google API client for the Business Profile APIs.
 
 This module answers one question: "How do I create an authenticated Google
-client?" It loads the OAuth token from ``GOOGLE_TOKEN_FILE``,
-keeps it fresh (refresh on expiry / 401), and exposes the Business Profile
-REST endpoints this application needs.
+client?" It loads the OAuth credentials (stored in PostgreSQL, see
+:mod:`app.auth.token_store`), keeps them fresh (refresh on expiry / 401),
+and exposes the Business Profile REST endpoints this application needs.
 
 Review business logic (what counts as unanswered, final checks, publishing
 policy) lives in :mod:`app.google.reviews`.
@@ -59,7 +59,7 @@ class GoogleAPIError(Exception):
 
 
 def get_google_client() -> "GoogleBusinessClient":
-    """Create an authenticated Business Profile client from the token file.
+    """Create an authenticated Business Profile client from the stored credentials.
 
     Raises GoogleOAuthError when the OAuth flow has not been completed or the
     stored credentials are unusable.

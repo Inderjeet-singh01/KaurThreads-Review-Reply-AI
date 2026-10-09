@@ -7,6 +7,7 @@ lives in app/api, app/auth, app/google, and app/ai.
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.automation import router as automation_router
 from app.api.locations import router as locations_router
 from app.api.reviews import router as reviews_router
+from app.auth import token_store
 from app.auth.google_oauth import router as google_auth_router
-from app.config import GOOGLE_TOKEN_FILE, settings
+from app.config import settings
 from app.webhooks.google_reviews import router as google_reviews_webhook_router
 from app.webhooks.pubsub import pubsub_auth_configured
 
@@ -54,15 +56,24 @@ if not settings.gemini_api_key:
 
 logger.info(
     "Automatic replies: enabled=%s dry_run=%s max_regenerations=%d "
-    "locations=%s webhook_auth_configured=%s token_file=%s "
-    "token_file_source=%s token_file_exists=%s",
+    "locations=%s webhook_auth_configured=%s token_store=postgresql "
+    "database_configured=%s encryption_key_configured=%s",
     settings.auto_reply_enabled, settings.auto_reply_dry_run,
     settings.auto_reply_max_regenerations,
     settings.auto_reply_location_list or "all", pubsub_auth_configured(),
-    GOOGLE_TOKEN_FILE,
-    "GOOGLE_TOKEN_FILE" if settings.google_token_file.strip() else "default",
-    GOOGLE_TOKEN_FILE.is_file(),
+    token_store.database_configured(), token_store.encryption_key_configured(),
 )
+try:
+    token_store.check_configuration()
+except token_store.TokenStoreError as exc:
+    # Not fatal: /health keeps answering and /auth/google/status reports it.
+    logger.error("Google credential storage is not usable: %s", exc)
+if settings.google_token_file.strip():
+    logger.warning(
+        "GOOGLE_TOKEN_FILE is set but no longer used: Google credentials are stored "
+        "in the database. Import an existing token once with "
+        "`python -m app.auth.import_token`, then remove GOOGLE_TOKEN_FILE"
+    )
 if settings.auto_reply_enabled and not pubsub_auth_configured():
     logger.warning(
         "AUTO_REPLY_ENABLED is true but PUBSUB_PUSH_AUDIENCE / "
@@ -90,7 +101,19 @@ if settings.automation_test_endpoint_enabled:
         "is exposed. Development only — disable it in production."
     )
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Create the credentials table at startup; close the pool on shutdown."""
+    try:
+        token_store.ensure_schema()
+    except token_store.TokenStoreError:
+        pass  # already logged; retried on first use
+    yield
+    token_store.close()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Google Review Reply AI",
     version="1.0.0",
     description=(

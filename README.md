@@ -31,7 +31,8 @@ A FastAPI application for a **boutique business** that:
 Google Business Profile
         │
         ▼
-app/auth/google_oauth.py        (OAuth 2.0: authorize URL, callback, token file)
+app/auth/google_oauth.py        (OAuth 2.0: authorize URL, callback, credential cache/refresh)
+app/auth/token_store.py         (encrypted credential storage in PostgreSQL)
         │
         ▼
 app/google/client.py            (authenticated Business Profile REST client)
@@ -87,7 +88,7 @@ state is stored.
 google-review-reply/
 ├── app/
 │   ├── main.py                  # FastAPI app, routers, health endpoint
-│   ├── config.py                # env-based settings, token file path
+│   ├── config.py                # env-based settings
 │   ├── api/
 │   │   ├── reviews.py           # GET /reviews, POST .../generate, .../validate, .../publish
 │   │   └── automation.py        # GET /automation/status, dev-only POST /automation/test/{id}
@@ -100,7 +101,9 @@ google-review-reply/
 │   │   ├── google_reviews.py    # POST /webhooks/google-reviews (Pub/Sub push)
 │   │   └── pubsub.py            # push JWT verification + notification decoding
 │   ├── auth/
-│   │   └── google_oauth.py      # OAuth 2.0 only (authorize, callback, token file) + auth endpoints
+│   │   ├── google_oauth.py      # OAuth 2.0 only (authorize, callback, refresh) + auth endpoints
+│   │   ├── token_store.py       # encrypted credential storage in PostgreSQL (DATABASE_URL)
+│   │   └── import_token.py      # one-time import of an existing token file
 │   ├── google/
 │   │   ├── client.py            # authenticated Business Profile REST client
 │   │   ├── reviews.py           # review fetching/filtering/final check/publish
@@ -113,7 +116,7 @@ google-review-reply/
 │   │   └── reply_validator.py   # manual "Check Reply" validation (Groq → Gemini fallback)
 │   └── schemas/
 │       └── review.py            # Pydantic API contracts
-├── credentials/                 # gitignored; google_token.json created after first OAuth
+├── credentials/                 # gitignored; legacy token file location (import source only)
 ├── .env                         # gitignored; real local secrets
 ├── .env.example                 # committed template with placeholders
 ├── .gitignore
@@ -168,7 +171,9 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
 | `GROQ_MODEL` | no | Groq model for generation. Default `llama-3.3-70b-versatile`. |
 | `GEMINI_MODEL` | no | Gemini model for fallback generation. Default `gemini-3.8-flash`. |
-| `GOOGLE_TOKEN_FILE` | no | Absolute path of the OAuth token file. Default `credentials/google_token.json`. Required on Render for automation (section 13.6). |
+| `DATABASE_URL` | yes | PostgreSQL connection string (Neon in production) where the Google OAuth credentials are stored. |
+| `GOOGLE_TOKEN_ENCRYPTION_KEY` | yes | Fernet key encrypting the stored credentials. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Comma-separate `new,old` to rotate. |
+| `GOOGLE_TOKEN_FILE` | no | Legacy token file; no longer read or written at runtime. Only the default source of `python -m app.auth.import_token`. |
 | `AUTO_REPLY_ENABLED` | no | `true` enables automatic replies to new reviews. Default **`false`**. |
 | `AUTO_REPLY_DRY_RUN` | no | `true` runs the full automatic pipeline without publishing (`WOULD_PUBLISH` log). Default `false`. |
 | `AUTO_REPLY_MAX_REGENERATIONS` | no | Regenerations after a failed validation: `0` or `1` (hard maximum). Default `1`. |
@@ -183,8 +188,14 @@ Copy `.env.example` to `.env` and fill it in:
 automatic fallback.
 
 The Google OAuth token is **not** an environment variable. After the first
-successful OAuth flow it is written to `credentials/google_token.json`
-(gitignored) and refreshed automatically while valid.
+successful OAuth flow it is stored, encrypted with
+`GOOGLE_TOKEN_ENCRYPTION_KEY`, in the `google_oauth_credentials` table of
+`DATABASE_URL` (created automatically at startup), and refreshed tokens are
+saved there too. The OAuth client secret is never stored in the database.
+There is no file fallback: if the database is unavailable, OAuth returns an
+error instead of saving the token somewhere temporary. For local development,
+use a separate Neon branch (or local PostgreSQL) — authorizing locally against
+the production database replaces the production credentials.
 
 ## 5. Groq API setup
 
@@ -234,16 +245,17 @@ uvicorn app.main:app --reload --port 8000
    `business.manage` scope.
 3. Google redirects the browser to
    `http://localhost:8000/auth/google/callback?code=...&state=...` — the app
-   exchanges the code for a token (with refresh token) and saves
-   `credentials/google_token.json`. The callback page shows the result.
+   exchanges the code for a token (with refresh token) and stores it in the
+   database. The callback page shows the result.
 4. `GET /auth/google/status` now shows `authenticated: true`.
 
 Notes:
 
 - The redirect must land on `http://localhost:8000` in a browser that can reach
   the server, so run this flow on the machine where the app runs.
-- If you switch Google accounts later, delete `credentials/google_token.json`
-  and repeat the flow (and restart the server).
+- To switch Google accounts, Disconnect (`POST /auth/google/logout` deletes
+  the stored credentials) and repeat the flow. A new authorization always
+  replaces the stored one.
 
 ## 9. API usage examples
 
@@ -390,8 +402,9 @@ GET /auth/google/callback    # OAuth redirect target (code + state)
 
 - All secrets live in `.env` (gitignored) — never in code or Git.
 - `.gitignore` excludes `.env`, `credentials/`, virtualenvs, and bytecode.
-- The OAuth token file is written `0600` and is gitignored; it is never
-  returned by any endpoint (auth status returns only booleans and expiry).
+- OAuth credentials are stored Fernet-encrypted in PostgreSQL (without the
+  client secret); they are never returned by any endpoint (auth status
+  returns only booleans, versions, timestamps and expiry) and never logged.
 - Error messages are sanitized: they include Google's error text where useful
   but never tokens, secrets, or credential file contents.
 - Tokens are refreshed automatically on expiry and on 401 (once, then the
@@ -624,7 +637,8 @@ Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
 | --- | --- |
 | `PUBSUB_PUSH_AUDIENCE` | exactly the `--push-auth-token-audience` above |
 | `PUBSUB_PUSH_SERVICE_ACCOUNT` | `gbp-reviews-push@PROJECT_ID.iam.gserviceaccount.com` |
-| `GOOGLE_TOKEN_FILE` | durable token path (see 13.6) |
+| `DATABASE_URL` | Neon connection string (see 13.6) |
+| `GOOGLE_TOKEN_ENCRYPTION_KEY` | Fernet key (see section 4 and 13.6) |
 | `AUTO_REPLY_ENABLED` | `false` → then `true` (see 13.7) |
 | `AUTO_REPLY_DRY_RUN` | `true` first, `false` once dry runs look right |
 | `AUTO_REPLY_LOCATION_IDS` | optional allowlist |
@@ -642,50 +656,48 @@ empty. The JWT is never logged.
 
 ### 13.6 Render deployment requirements
 
-- **The OAuth token must survive restarts.** Render's default filesystem is
-  ephemeral: `credentials/google_token.json` is lost on every deploy,
-  restart and (free plan) spin-down, and the automation then fails with
-  "Google OAuth has not been completed". Pick one:
-  - **Persistent disk (recommended; paid instance):** attach a disk, e.g. at
-    `/var/data`, set `GOOGLE_TOKEN_FILE=/var/data/google_token.json`, and
-    complete the OAuth flow once through the deployed app (the
-    `GOOGLE_REDIRECT_URI` must be the Render backend's
-    `/auth/google/callback`, registered on the OAuth client). Refreshed
-    tokens are saved there. A disk also limits the service to one instance,
-    which this automation needs anyway.
-  - **Secret File:** run OAuth locally, upload the resulting
-    `google_token.json` as a Render Secret File, and set
-    `GOOGLE_TOKEN_FILE=/etc/secrets/google_token.json`. The app keeps
-    refreshed access tokens in memory if the file cannot be written.
-    The file contains the refresh token **and the OAuth client secret** —
-    keep it out of Git. Don't use Connect/Disconnect on Render with this
-    option; re-run OAuth locally and re-upload to rotate.
-- **Verify the token path** after every deploy. The startup log line
-  `Automatic replies: ...` ends with `token_file=... token_file_source=...
-  token_file_exists=...`, and `GET /auth/google/status` reports (no token
-  values) `configured_token_path`, `token_path_source` (`GOOGLE_TOKEN_FILE`
-  or `default`), `env_variable_set`, `file_exists`, `file_readable`,
-  `credential_type` and `refresh_token_present`.
+- **OAuth credentials live in PostgreSQL (Neon free tier is enough).** Set
+  `DATABASE_URL` (the Neon connection string) and
+  `GOOGLE_TOKEN_ENCRYPTION_KEY` on the service. The table is created at
+  startup (idempotent). Complete the OAuth flow once through the deployed
+  app (`GOOGLE_REDIRECT_URI` must be the Render backend's
+  `/auth/google/callback`, registered on the OAuth client); the credentials
+  then survive restarts, redeploys and free-plan spin-down, and refreshed
+  tokens are saved automatically. No disk or Secret File is needed.
+  **Keep the encryption key safe:** losing or changing it makes the stored
+  credentials unreadable (re-authorize to recover).
+- **Migrating an existing token file** (optional; re-authorizing is
+  simpler): on a machine that has the file, with the production
+  `DATABASE_URL`, `GOOGLE_TOKEN_ENCRYPTION_KEY`, `GOOGLE_CLIENT_ID` and
+  `GOOGLE_CLIENT_SECRET` in the environment, run
+  `python -m app.auth.import_token path/to/google_token.json`. It never
+  overwrites stored credentials unless `--replace` is given, and never
+  changes the file. `GOOGLE_TOKEN_FILE` (e.g. a Secret File at
+  `/etc/secrets/google_token.json`) is ignored at runtime; remove it once
+  the database holds working credentials.
+- **Verify after every deploy.** The startup log line `Automatic replies:
+  ...` ends with `token_store=postgresql database_configured=...
+  encryption_key_configured=...`, and `GET /auth/google/status` reports (no
+  token values) `database_configured`, `encryption_key_configured`,
+  `database_reachable`, `credentials_stored`, `stored_version`,
+  `stored_updated_at`, `refresh_token_present` and `refreshed_token_unsaved`.
   `GET /auth/google/status?verify=true` also makes one read-only Business
-  Profile call (`google_api_ok`). `token_path_source: "default"` on Render
-  means the running process does not see `GOOGLE_TOKEN_FILE` — check the
-  key name on *this* service and redeploy. `credential_type:
-  "oauth_client_config"` means the client secret JSON from Cloud Console
-  was uploaded instead of the OAuth token file.
+  Profile call (`google_api_ok`).
 - **Expired access tokens are normal.** Access tokens last about an hour;
-  the app refreshes them with the stored refresh token and keeps the
-  refreshed credentials in memory until they expire again (one refresh per
-  hour, not one per Google call). With a read-only Secret File the log line
-  "Refreshed Google access token could not be written … continuing with the
-  in-memory token" is expected and harmless. Re-authentication is only
-  needed when the *refresh* token is revoked or expired.
+  the app refreshes them with the stored refresh token, saves the result,
+  and reuses it until it expires again (one refresh per hour, not one per
+  Google call). A refreshed token is only saved if nobody stored newer
+  credentials meanwhile, so a stale instance never overwrites a new
+  authorization. If the database is briefly unreachable, the in-memory
+  credentials keep working and the save is retried. Re-authentication is
+  only needed when the *refresh* token is revoked or expired.
 - **Refresh tokens must not expire:** while the OAuth consent screen's
   publishing status is **Testing**, Google expires refresh tokens after
   7 days. Set it to **In production** for unattended use.
 - **Single process / single instance** (see 13.3).
 - **Free plan spin-down:** an idle free service sleeps after 15 minutes and
   takes about a minute to wake. Pub/Sub keeps retrying, so events are not
-  lost, but a paid instance is more reliable (and needed for a disk).
+  lost, but a paid instance is more reliable.
 
 ### 13.7 Rollout and testing
 
@@ -716,8 +728,12 @@ empty. The JWT is never logged.
 duplicate memory is skipped so the same review can be re-tested). It returns
 404 unless the flag is on.
 
-**Unit tests:** `python -m unittest discover -s tests` (automation tests:
-`tests/test_automation.py`, all Google/AI calls mocked).
+**Unit tests:** `pip install -r requirements-dev.txt`, then
+`python -m unittest discover -s tests -t .` (automation tests:
+`tests/test_automation.py`, all Google/AI calls mocked). The credential-store
+tests (`tests/test_token_store.py`) run against a throwaway local PostgreSQL
+started by `pgserver`, or `TEST_DATABASE_URL` if set; they never use
+`DATABASE_URL`.
 
 ### 13.8 Run logs
 

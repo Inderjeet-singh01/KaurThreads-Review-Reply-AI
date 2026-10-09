@@ -2,8 +2,8 @@
 
 All secrets are read from environment variables (optionally via a local
 `.env` file). Nothing sensitive is hardcoded, and the Google OAuth token is
-never stored in `.env` — it lives in GOOGLE_TOKEN_FILE (default
-`credentials/google_token.json`).
+never stored in `.env` — it lives, encrypted, in the PostgreSQL database
+named by DATABASE_URL (see app/auth/token_store.py).
 """
 
 from __future__ import annotations
@@ -16,9 +16,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Project root = the directory that contains the `app/` package.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Where the Google OAuth token is persisted by default. This directory is
-# gitignored. GOOGLE_TOKEN_FILE (see Settings) can point elsewhere, e.g. a
-# persistent disk in production — resolved at the bottom of this module.
+# Default location of the legacy token file (gitignored). Only used as the
+# import source of `python -m app.auth.import_token`.
 CREDENTIALS_DIR = PROJECT_ROOT / "credentials"
 
 # Google Business Profile management scope required by this application.
@@ -53,10 +52,15 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
 
-    # --- Google OAuth token location (optional) ----------------------------
-    # Absolute path of the OAuth token file. Empty = credentials/google_token.json.
-    # Render's default filesystem is ephemeral, so production automation needs
-    # this on a persistent disk (or a Render Secret File) — see README.
+    # --- Google OAuth credential storage (PostgreSQL, e.g. Neon) -----------
+    # Connection string of the database that stores the OAuth credentials.
+    # Required: without it OAuth cannot complete and Google calls fail.
+    database_url: str = ""
+    # Fernet key(s) encrypting the stored credentials. Comma-separate several
+    # keys to rotate (the first encrypts, all decrypt). Required.
+    google_token_encryption_key: str = ""
+    # Legacy token file. No longer read or written at runtime; only the
+    # default source path of `python -m app.auth.import_token`.
     google_token_file: str = ""
 
     # --- Automatic review replies (Pub/Sub webhook) ------------------------
@@ -145,7 +149,7 @@ class Settings(BaseSettings):
 
 
 def resolve_google_token_file(configured: str) -> Path:
-    """The OAuth token path: GOOGLE_TOKEN_FILE when set, else the default.
+    """The legacy token file path: GOOGLE_TOKEN_FILE when set, else the default.
 
     Surrounding whitespace/quotes (easy to paste into a dashboard) are
     ignored, and a relative path is anchored at the project root rather than
@@ -160,6 +164,5 @@ def resolve_google_token_file(configured: str) -> Path:
 
 settings = Settings()
 
-# The single canonical token path. Every reader/writer (OAuth callback,
-# status, load_credentials -> Google client -> automation) uses this value.
+# The legacy token file path (import source only; see google_token_file).
 GOOGLE_TOKEN_FILE = resolve_google_token_file(settings.google_token_file)

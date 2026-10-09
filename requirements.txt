@@ -7,6 +7,11 @@ google-auth>=2.29
 google-auth-oauthlib>=1.2
 requests>=2.31
 
+# Google OAuth credential storage: PostgreSQL (Neon) + Fernet encryption
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+cryptography>=42
+
 # Groq API (AI reply generation)
 groq>=0.13
 

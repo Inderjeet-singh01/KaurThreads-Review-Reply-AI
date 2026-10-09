@@ -828,14 +828,19 @@ class AutomationEndpointTests(AutomationTestCase):
         self.publish.assert_not_called()
 
 
-# --- Token persistence on read-only storage ----------------------------------------------
+# --- Token persistence when the credential database is unavailable ---------------------
 class TokenPersistenceTests(unittest.TestCase):
-    def test_refresh_survives_read_only_token_file(self):
-        from app.auth import google_oauth
+    def test_refresh_survives_database_write_failure(self):
+        from app.auth import google_oauth, token_store
 
         credentials = mock.MagicMock(expired=True, refresh_token="refresh")
-        with mock.patch.object(google_oauth, "save_credentials", side_effect=PermissionError()), \
+        credentials.to_json.return_value = "{}"
+        entry = google_oauth._CacheEntry(credentials, version=1, checked_at=time.monotonic())
+        with mock.patch.object(google_oauth, "_cache", entry), \
+                mock.patch.object(token_store, "save_if_version",
+                                  side_effect=token_store.TokenStoreError("down")), \
                 self.assertLogs("app.auth.google_oauth", level="WARNING"):
             google_oauth.refresh_credentials_if_needed(credentials)
             self.assertTrue(google_oauth.force_refresh_credentials(credentials))
         self.assertEqual(credentials.refresh.call_count, 2)
+        self.assertTrue(entry.unsaved)  # retried at the next database check

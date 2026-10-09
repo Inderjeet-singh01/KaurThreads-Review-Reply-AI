@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Tests only: a local PostgreSQL server for the credential-store tests
+# (alternatively point TEST_DATABASE_URL at a disposable database).
+pgserver>=0.1.4

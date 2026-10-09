@@ -5,8 +5,8 @@ This module ONLY handles OAuth authentication/authorization:
 * creating the Google authorization URL,
 * the required OAuth scopes,
 * the OAuth callback (authorization code -> credentials),
-* loading / saving / refreshing the token in ``GOOGLE_TOKEN_FILE`` (default
-  ``credentials/google_token.json``; see :mod:`app.config`).
+* loading / saving / refreshing the credentials, which are stored encrypted
+  in PostgreSQL (``DATABASE_URL``; see :mod:`app.auth.token_store`).
 
 It never fetches reviews and never publishes replies.
 """
@@ -15,20 +15,22 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
+from app.auth import token_store
 from app.config import (
     GOOGLE_AUTH_URL,
     GOOGLE_SCOPE_BUSINESS_MANAGE,
-    GOOGLE_TOKEN_FILE,
     GOOGLE_TOKEN_URL,
     settings,
 )
@@ -52,14 +54,25 @@ _current_flow: Flow | None = None
 # 123456789012-abc123def456.apps.googleusercontent.com
 _CLIENT_ID_RE = re.compile(r"^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$")
 
-# Process-wide credentials cache. GOOGLE_TOKEN_FILE may be read-only (a
-# Render Secret File), so a refreshed access token can only live in memory:
-# without this cache every Google call would re-read the stale file and
-# refresh again. The entry is keyed by the file's path, mtime and size, so a
-# new token (OAuth callback, re-upload) or a deleted file is picked up.
-# The lock serializes refreshes across the automation's worker threads.
+# How often the cached credentials are compared with the database row, so a
+# new authorization or a logout made by another instance is picked up.
+CACHE_RECHECK_SECONDS = 60
+
+
+@dataclass
+class _CacheEntry:
+    credentials: Credentials
+    version: int  # database row version these credentials were loaded/saved as
+    checked_at: float  # time.monotonic() of the last database check
+    unsaved: bool = False  # refreshed in memory, database write failed
+
+
+# Process-wide credentials cache: one Credentials object shared by every
+# Google call, so an access token is refreshed once per expiry (not per call)
+# and the database is read at most every CACHE_RECHECK_SECONDS. The lock
+# serializes loads and refreshes across the automation's worker threads.
 _credentials_lock = threading.RLock()
-_cached_credentials: tuple[tuple[str, int, int], Credentials] | None = None
+_cache: _CacheEntry | None = None
 
 
 class GoogleOAuthError(Exception):
@@ -68,6 +81,14 @@ class GoogleOAuthError(Exception):
 
 class GoogleOAuthNotConfiguredError(GoogleOAuthError):
     """OAuth client settings are not present in the environment / .env."""
+
+
+class GoogleTokenStoreError(GoogleOAuthError):
+    """The credential database is not configured or unavailable.
+
+    Not an authentication failure: re-authorizing does not help, so the API
+    answers 503 instead of 401.
+    """
 
 
 def _require_oauth_config() -> None:
@@ -135,7 +156,8 @@ def complete_authorization(code: str, state: str) -> Credentials:
     holds the PKCE code_verifier Google expects in the code exchange).
 
     Raises GoogleOAuthError when the state does not match or Google rejects
-    the code. On success the token file is written.
+    the code, and GoogleTokenStoreError when the credentials cannot be saved
+    to the database. On success the credentials are stored.
     """
     global _current_flow
     if _current_state is not None and state != _current_state:
@@ -165,58 +187,125 @@ def complete_authorization(code: str, state: str) -> Credentials:
             f"Google rejected the authorization code ({exc}). Please retry "
             f"the authorization flow.{hint}"
         ) from exc
-    try:
-        save_credentials(_current_flow.credentials)
-    except OSError as exc:
-        logger.error(
-            "Could not write the Google token file at %s (%s)",
-            GOOGLE_TOKEN_FILE, type(exc).__name__,
-        )
+    credentials = _current_flow.credentials
+    if not credentials.refresh_token:
+        # Storing it would replace a working refresh token with credentials
+        # that stop working within the hour.
+        logger.error("Google OAuth returned no refresh token; nothing was stored")
         raise GoogleOAuthError(
-            f"Google OAuth succeeded but the token could not be saved to "
-            f"{GOOGLE_TOKEN_FILE} ({type(exc).__name__}). If GOOGLE_TOKEN_FILE "
-            "points at a read-only Render Secret File, upload the token there "
-            "instead of running the OAuth flow in production."
-        ) from exc
-    logger.info("Google OAuth completed; token saved to %s", GOOGLE_TOKEN_FILE)
-    return _current_flow.credentials
-
-
-def save_credentials(credentials: Credentials) -> None:
-    """Persist the OAuth token (including refresh token) to the token file."""
-    GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(GOOGLE_TOKEN_FILE, "w", encoding="utf-8") as token_file:
-        token_file.write(credentials.to_json())
+            "Google did not return a refresh token, so the app could not stay "
+            "connected. Remove this app's access at "
+            "https://myaccount.google.com/permissions and authorize again. "
+            "Previously stored credentials were left unchanged."
+        )
     try:
-        os.chmod(GOOGLE_TOKEN_FILE, 0o600)  # best effort (non-POSIX safe)
-    except OSError:
-        pass
+        version = save_credentials(credentials)
+    except GoogleTokenStoreError as exc:
+        logger.error(
+            "Google OAuth succeeded but the credentials could not be stored; nothing was saved"
+        )
+        raise GoogleTokenStoreError(
+            f"Google OAuth succeeded but the credentials could not be saved: {exc} "
+            "Nothing was stored. Fix the database configuration, then authorize "
+            "again via GET /auth/google/authorize."
+        ) from exc
+    logger.info("Google OAuth completed; credentials saved to the database (version %d)", version)
+    return credentials
+
+
+def _credentials_to_info(credentials: Credentials) -> dict[str, Any]:
+    """The authorized-user info to store: everything but the client secret."""
+    info = json.loads(credentials.to_json())
+    info.pop("client_secret", None)
+    return info
+
+
+def _credentials_from_info(info: dict[str, Any]) -> Credentials:
+    """Rebuild Credentials from stored info plus GOOGLE_CLIENT_SECRET."""
+    client_id = info.get("client_id")
+    if client_id and settings.google_client_id and client_id != settings.google_client_id:
+        raise GoogleOAuthError(
+            "The stored Google credentials belong to a different OAuth client "
+            "than GOOGLE_CLIENT_ID. Authorize again via GET /auth/google/authorize."
+        )
+    if not info.get("refresh_token"):
+        raise GoogleOAuthError(
+            "The stored Google credentials have no refresh token. Authorize "
+            "again via GET /auth/google/authorize."
+        )
+    try:
+        return Credentials.from_authorized_user_info(
+            {**info, "client_secret": settings.google_client_secret}, SCOPES
+        )
+    except (ValueError, KeyError) as exc:
+        raise GoogleOAuthError(
+            "The stored Google credentials are not usable. Authorize again "
+            "via GET /auth/google/authorize."
+        ) from exc
+
+
+def _store_error(exc: token_store.TokenStoreError) -> GoogleTokenStoreError:
+    return GoogleTokenStoreError(str(exc))
+
+
+def save_credentials(credentials: Credentials) -> int:
+    """Store a NEW authorization in the database, replacing any stored one.
+
+    Returns the stored version. Raises GoogleTokenStoreError when the
+    database is not configured or the write fails — there is deliberately no
+    fallback to a local file.
+    """
+    global _cache
+    with _credentials_lock:
+        try:
+            version = token_store.save(_credentials_to_info(credentials))
+        except token_store.TokenStoreError as exc:
+            raise _store_error(exc) from exc
+        _cache = _CacheEntry(credentials, version, time.monotonic())
+    return version
 
 
 def _persist_refreshed(credentials: Credentials) -> None:
-    """Best-effort save after a refresh.
+    """Save a refreshed access token without overwriting newer credentials.
 
-    The refresh token is unchanged by a refresh, so a read-only token file
-    (e.g. a Render Secret File) keeps working: the new access token simply
-    lives in memory and is refreshed again when needed.
+    Only the cached credentials are saved (their stored version is known),
+    and only if the row still has that version: when another instance or a
+    new authorization wrote meanwhile, the newer row wins and is reloaded.
+    A database failure keeps the new access token in memory — the stored
+    refresh token is still valid — and the save is retried at the next
+    database check. Caller holds ``_credentials_lock``.
     """
+    entry = _cache
+    if entry is None or entry.credentials is not credentials:
+        logger.info("Refreshed Google credentials are no longer the current ones; not saving them")
+        return
     try:
-        save_credentials(credentials)
-    except OSError as exc:
+        version = token_store.save_if_version(_credentials_to_info(credentials), entry.version)
+    except token_store.TokenStoreError:
+        entry.unsaved = True
         logger.warning(
-            "Refreshed Google access token could not be written to %s (%s); "
-            "continuing with the in-memory token (expected for a read-only "
-            "Render Secret File; the refresh token is unchanged)",
-            GOOGLE_TOKEN_FILE, type(exc).__name__,
+            "Refreshed Google access token could not be saved to the database; "
+            "continuing with the in-memory token (the stored refresh token is "
+            "unchanged) and retrying the save at the next database check"
         )
+        return
+    entry.unsaved = False
+    if version is None:
+        logger.warning(
+            "Google credentials changed in the database during a token refresh "
+            "(new authorization, logout, or another instance); not overwriting them"
+        )
+        entry.checked_at = float("-inf")  # reload on the next load_credentials()
+        return
+    entry.version = version
+    logger.info("Refreshed Google access token saved to the database (version %d)", version)
 
 
 def refresh_credentials_if_needed(credentials: Credentials) -> None:
     """Refresh an expired access token when a refresh token is available.
 
-    The refreshed token is persisted (best effort) so the next process start
-    benefits from it. Raises the underlying refresh error when refreshing
-    fails.
+    The refreshed token is saved to the database (see _persist_refreshed).
+    Raises the underlying refresh error when refreshing fails.
     """
     with _credentials_lock:
         if credentials.expired and credentials.refresh_token:
@@ -243,139 +332,122 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
         return False
 
 
-def _token_file_key() -> tuple[str, int, int] | None:
-    try:
-        stat = GOOGLE_TOKEN_FILE.stat()
-    except OSError:
-        return None
-    return (str(GOOGLE_TOKEN_FILE), stat.st_mtime_ns, stat.st_size)
-
-
 def clear_credentials_cache() -> None:
     """Drop the in-memory credentials (logout, tests)."""
-    global _cached_credentials
+    global _cache
     with _credentials_lock:
-        _cached_credentials = None
+        _cache = None
 
 
 def load_credentials() -> Credentials:
-    """Load usable Google credentials from ``GOOGLE_TOKEN_FILE``.
+    """Load usable Google credentials (database-backed, cached in memory).
 
     Raises GoogleOAuthError when the OAuth flow has not been completed or the
-    stored credentials can no longer be used.
+    stored credentials can no longer be used, and GoogleTokenStoreError when
+    the database is not configured or unreachable (and nothing is cached).
 
-    The credentials object is reused across calls while the file is
-    unchanged (see ``_cached_credentials``), so an access token refreshed in
-    memory — e.g. because the file is a read-only Render Secret File — is
-    used until it expires instead of being refreshed on every call. An
-    expired access token is never a reason to re-authenticate: it is
-    refreshed with the stored refresh token.
+    The cached credentials are reused between database checks, so a
+    refreshed access token is used until it expires. An expired access token
+    is never a reason to re-authenticate: it is refreshed with the stored
+    refresh token and the result saved.
     """
-    global _cached_credentials
-    if not GOOGLE_TOKEN_FILE.exists():
-        clear_credentials_cache()
-        raise GoogleOAuthError(
-            "Google OAuth has not been completed yet: no token file at "
-            f"{GOOGLE_TOKEN_FILE}. Complete the flow via "
-            "GET /auth/google/authorize."
-        )
     with _credentials_lock:
-        key = _token_file_key()
-        if _cached_credentials is not None and key is not None and _cached_credentials[0] == key:
-            credentials = _cached_credentials[1]
-        else:
-            try:
-                credentials = Credentials.from_authorized_user_file(
-                    str(GOOGLE_TOKEN_FILE), SCOPES
-                )
-            except (OSError, ValueError, KeyError) as exc:
-                _cached_credentials = None
-                raise GoogleOAuthError(
-                    f"Could not read the Google credentials file at {GOOGLE_TOKEN_FILE}. "
-                    "Delete the file and complete the OAuth flow again."
-                ) from exc
-        return _ensure_usable(credentials)
+        entry = _cache
+        now = time.monotonic()
+        if entry is None or now - entry.checked_at >= CACHE_RECHECK_SECONDS:
+            entry = _sync_with_database(entry, now)
+        return _ensure_usable(entry)
 
 
-def _ensure_usable(credentials: Credentials) -> Credentials:
-    """Refresh if needed, cache, and return credentials (lock held)."""
-    global _cached_credentials
+def _sync_with_database(entry: _CacheEntry | None, now: float) -> _CacheEntry:
+    """Reconcile the cache with the stored row (lock held)."""
+    global _cache
+    try:
+        stored = token_store.load()
+    except token_store.TokenStoreError as exc:
+        if entry is not None:
+            # Keep working through a database outage with the credentials
+            # already in memory; check again after the normal interval.
+            logger.warning(
+                "Credential database unavailable; continuing with the in-memory Google credentials"
+            )
+            entry.checked_at = now
+            return entry
+        raise _store_error(exc) from exc
+    if stored is None:
+        _cache = None
+        raise GoogleOAuthError(
+            "Google OAuth has not been completed yet: no Google credentials are "
+            "stored in the database. Complete the flow via GET /auth/google/authorize."
+        )
+    if entry is not None and entry.version == stored.version:
+        entry.checked_at = now
+        if entry.unsaved:
+            _persist_refreshed(entry.credentials)
+        return entry
+    try:
+        credentials = _credentials_from_info(stored.info)
+    except GoogleOAuthError:
+        _cache = None
+        raise
+    _cache = _CacheEntry(credentials, stored.version, now)
+    return _cache
+
+
+def _ensure_usable(entry: _CacheEntry) -> Credentials:
+    """Refresh if needed and return the cached credentials (lock held)."""
+    credentials = entry.credentials
     try:
         refresh_credentials_if_needed(credentials)
+    except RefreshError as exc:
+        logger.error("Google token refresh failed: %s", exc)
+        # Maybe re-authorized elsewhere: re-read the database next time. The
+        # stored credentials are never deleted automatically.
+        entry.checked_at = float("-inf")
+        raise GoogleOAuthError(
+            "The stored Google credentials could not be refreshed: the refresh "
+            "token was revoked or has expired. Authorize again via "
+            "GET /auth/google/authorize."
+        ) from exc
     except Exception as exc:
         logger.error("Google token refresh failed: %s", exc)
         raise GoogleOAuthError(
-            "The stored Google credentials have expired and could not be "
-            f"refreshed automatically. Replace {GOOGLE_TOKEN_FILE} by "
-            "completing the OAuth flow again."
+            "The Google access token expired and could not be refreshed "
+            f"({type(exc).__name__}). This is usually temporary; try again shortly."
         ) from exc
     if not credentials.token:
         raise GoogleOAuthError(
-            f"The stored Google credentials in {GOOGLE_TOKEN_FILE} are not "
-            "usable. Replace the file by completing the OAuth flow again "
+            "The stored Google credentials are not usable. Authorize again "
             "via GET /auth/google/authorize."
         )
-    # Re-read the key: a successful refresh may have rewritten the file.
-    key = _token_file_key()
-    _cached_credentials = (key, credentials) if key is not None else None
     return credentials
 
 
-def _credential_type(data: Any) -> str:
-    """Classify a token file by its keys only (values are never inspected)."""
-    if not isinstance(data, dict):
-        return "unknown"
-    if "web" in data or "installed" in data:
-        # The OAuth client secret downloaded from Google Cloud Console — not
-        # a user token; it cannot authenticate API calls.
-        return "oauth_client_config"
-    if data.get("type") == "service_account":
-        return "service_account"
-    if data.get("refresh_token") or data.get("type") == "authorized_user":
-        return "authorized_user"
-    return "unknown"
-
-
-def token_file_diagnostics() -> dict[str, Any]:
-    """Safe metadata about the configured token file — never its contents.
-
-    Reports where the token is expected, why (GOOGLE_TOKEN_FILE or default),
-    and whether the file exists, is readable, and looks like a user token.
-    """
-    path = GOOGLE_TOKEN_FILE
-    exists = path.is_file()
+def token_storage_diagnostics() -> dict[str, Any]:
+    """Safe facts about the credential store — never credential values."""
     info: dict[str, Any] = {
-        "configured_token_path": str(path),
-        "token_path_source": (
-            "GOOGLE_TOKEN_FILE" if settings.google_token_file.strip() else "default"
-        ),
-        "env_variable_set": bool(os.environ.get("GOOGLE_TOKEN_FILE", "").strip()),
-        "file_exists": exists,
-        "file_readable": exists and os.access(path, os.R_OK),
+        "token_store": "postgresql",
+        "database_configured": token_store.database_configured(),
+        "encryption_key_configured": token_store.encryption_key_configured(),
     }
-    if info["file_readable"]:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            info["credential_type"] = "invalid_json"
-        else:
-            info["credential_type"] = _credential_type(data)
-            info["refresh_token_present"] = bool(
-                isinstance(data, dict) and data.get("refresh_token")
-            )
-    elif not exists:
-        # Helps spot a Secret File uploaded under a different name. Only file
-        # NAMES containing "token" are listed, never contents.
-        parent = path.parent
-        info["parent_dir_exists"] = parent.is_dir()
-        if info["parent_dir_exists"]:
-            try:
-                info["similar_files_in_dir"] = sorted(
-                    entry.name for entry in parent.iterdir()
-                    if "token" in entry.name.lower()
-                )[:10]
-            except OSError:
-                pass
+    if settings.google_token_file.strip():
+        # Kept compatible, but the file is no longer read or written.
+        info["legacy_token_file_ignored"] = True
+    try:
+        metadata = token_store.metadata()
+    except token_store.TokenStoreError as exc:
+        if info["database_configured"] and info["encryption_key_configured"]:
+            info["database_reachable"] = False
+        info["storage_error"] = str(exc)
+        return info
+    info["database_reachable"] = True
+    info["credentials_stored"] = metadata is not None
+    if metadata is not None:
+        info["stored_version"] = metadata.version
+        info["stored_updated_at"] = (
+            metadata.updated_at.isoformat() if metadata.updated_at else None
+        )
+        info["stored_scopes"] = metadata.scopes.split()
     return info
 
 
@@ -394,24 +466,20 @@ def _verify_google_api() -> dict[str, Any]:
 def get_auth_status(verify: bool = False) -> dict[str, Any]:
     """Report whether the app currently holds usable Google credentials.
 
-    Always includes :func:`token_file_diagnostics`. With ``verify`` a live
-    Google Business Profile call confirms the token actually works.
+    Always includes :func:`token_storage_diagnostics`. With ``verify`` a
+    live Google Business Profile call confirms the token actually works.
     """
-    diagnostics = token_file_diagnostics()
-    if not diagnostics["file_exists"]:
-        return {
-            "authenticated": False,
-            "reason": f"OAuth not completed (no token file at {GOOGLE_TOKEN_FILE}).",
-            **diagnostics,
-        }
+    diagnostics = token_storage_diagnostics()
     try:
         credentials = load_credentials()
     except GoogleOAuthError as exc:
         return {"authenticated": False, "reason": str(exc), **diagnostics}
+    entry = _cache
     result: dict[str, Any] = {
         "authenticated": True,
         "expires_at": credentials.expiry.isoformat() if credentials.expiry else None,
-        "token_file": str(GOOGLE_TOKEN_FILE),
+        "refresh_token_present": bool(credentials.refresh_token),
+        "refreshed_token_unsaved": bool(entry and entry.unsaved),
         **diagnostics,
     }
     if verify:
@@ -432,8 +500,8 @@ def auth_status(
 ) -> dict[str, Any]:
     """Whether the app currently holds valid Google credentials.
 
-    Includes safe token-file diagnostics (path, existence, readability,
-    credential type) — never token values.
+    Includes safe credential-store diagnostics (database configured and
+    reachable, credentials stored, version, last update) — never token values.
     """
     return get_auth_status(verify=verify)
 
@@ -489,26 +557,25 @@ def callback(
 
 @router.post("/logout")
 def logout() -> dict[str, Any]:
-    """Disconnect the Google account by deleting the stored token file."""
+    """Disconnect the Google account by deleting the stored credentials."""
     global _current_state, _current_flow
     _current_state = None
     _current_flow = None
-    clear_credentials_cache()
-    existed = GOOGLE_TOKEN_FILE.exists()
-    if existed:
+    with _credentials_lock:
         try:
-            GOOGLE_TOKEN_FILE.unlink()
-        except OSError as exc:
-            logger.error("Failed to delete token file: %s", exc)
+            existed = token_store.delete()
+        except token_store.TokenStoreError as exc:
             raise HTTPException(
-                status_code=500,
-                detail="Could not disconnect the Google account. Try again.",
+                status_code=503,
+                detail=f"Could not disconnect the Google account. {exc}",
             ) from exc
-    logger.info("Google account disconnected (token file removed=%s)", existed)
+        finally:
+            clear_credentials_cache()
+    logger.info("Google account disconnected (stored credentials removed=%s)", existed)
     return {"authenticated": False, "message": "Google account disconnected."}
 
 
 def _oauth_http_error(exc: GoogleOAuthError) -> HTTPException:
-    if isinstance(exc, GoogleOAuthNotConfiguredError):
+    if isinstance(exc, (GoogleOAuthNotConfiguredError, GoogleTokenStoreError)):
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=400, detail=str(exc))
