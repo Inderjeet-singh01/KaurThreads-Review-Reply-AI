@@ -109,13 +109,20 @@ class ApiTestCase(DatabaseTestCase, SecretsMixin):
             patcher = mock.patch.object(google_oauth, name, None)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # JSON callback answers unless a test configures the frontend redirect.
+        patcher = mock.patch.object(settings, "frontend_url", "")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def callback(self, credentials: Credentials, state="s"):
-        flow = mock.MagicMock()
-        flow.credentials = credentials
+    def callback(self, credentials: Credentials, state="s", query: str = "code=c", flow=None):
+        if flow is None:
+            flow = mock.MagicMock()
+            flow.credentials = credentials
         with mock.patch.object(google_oauth, "_current_flow", flow), \
                 mock.patch.object(google_oauth, "_current_state", "s"):
-            return self.client.get(f"/auth/google/callback?code=c&state={state}")
+            return self.client.get(
+                f"/auth/google/callback?{query}&state={state}", follow_redirects=False
+            )
 
     def status(self, **params) -> dict:
         response = self.client.get("/auth/google/status", params=params)
@@ -158,6 +165,131 @@ class CallbackTests(ApiTestCase):
             with mock.patch.object(settings, "google_token_file", str(legacy)):
                 self.assertEqual(self.callback(make_credentials()).status_code, 200)
             self.assertFalse(legacy.exists())
+
+
+# --- 1b. Callback returns the browser to the frontend ------------------------------------
+FRONTEND = "https://kaurthreads-test.netlify.app"
+SUCCESS_URL = f"{FRONTEND}/?google_auth=success"
+
+
+class FrontendRedirectTests(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(settings, "frontend_url", FRONTEND + "/")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_error_redirect(self, response, reason: str):
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            response.headers["location"], f"{FRONTEND}/?google_auth=error&reason={reason}"
+        )
+
+    def test_success_redirects_to_frontend_after_saving(self):
+        response = self.callback(make_credentials())
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], SUCCESS_URL)
+        self.assertEqual(self.raw_row()[1], 1)
+        self.assertEqual(stored_info()["refresh_token"], "fake-refresh-token-value")
+        self.assert_no_secrets(dict(response.headers))
+        self.assert_no_secrets(response.text)
+        self.assertTrue(self.status()["authenticated"])
+
+    def test_credentials_are_saved_before_the_redirect_is_built(self):
+        events = []
+        real_save, real_redirect = token_store.save, google_oauth.RedirectResponse
+
+        def save(info):
+            events.append("save")
+            return real_save(info)
+
+        def redirect(url, **kwargs):
+            events.append("redirect")
+            return real_redirect(url, **kwargs)
+
+        with mock.patch.object(token_store, "save", side_effect=save), \
+                mock.patch.object(google_oauth, "RedirectResponse", side_effect=redirect):
+            response = self.callback(make_credentials())
+        self.assertEqual(response.headers["location"], SUCCESS_URL)
+        self.assertEqual(events, ["save", "redirect"])
+
+    def test_state_mismatch_still_rejected(self):
+        response = self.callback(make_credentials(), state="forged")
+        self.assert_error_redirect(response, "state_mismatch")
+        self.assertIsNone(self.raw_row())
+
+    def test_failed_code_exchange_is_not_a_success(self):
+        flow = mock.MagicMock()
+        flow.fetch_token.side_effect = ValueError("invalid_grant")
+        response = self.callback(make_credentials(), flow=flow)
+        self.assert_error_redirect(response, "oauth_failed")
+        self.assertNotIn("invalid_grant", response.headers["location"])
+        self.assertIsNone(self.raw_row())
+
+    def test_storage_failure_is_not_a_success(self):
+        with mock.patch.object(token_store, "save",
+                               side_effect=token_store.TokenStoreError("database down")):
+            response = self.callback(make_credentials())
+        self.assert_error_redirect(response, "storage_unavailable")
+        self.assertIsNone(self.raw_row())
+        self.assertFalse(self.status()["authenticated"])
+
+    def test_missing_refresh_token_keeps_previous_credentials(self):
+        self.callback(make_credentials())
+        response = self.callback(make_credentials(token="other", refresh=None))
+        self.assert_error_redirect(response, "no_refresh_token")
+        self.assertEqual(stored_info()["refresh_token"], "fake-refresh-token-value")
+
+    def test_user_cancelled_at_google(self):
+        flow = mock.MagicMock()
+        response = self.callback(make_credentials(), flow=flow, query="error=access_denied")
+        self.assert_error_redirect(response, "access_denied")
+        flow.fetch_token.assert_not_called()
+        self.assertIsNone(self.raw_row())
+
+    def test_google_error_text_is_never_reflected(self):
+        response = self.callback(
+            make_credentials(), query="error=%3Cscript%3Ehttps%3A%2F%2Fevil.example"
+        )
+        self.assert_error_redirect(response, "access_denied")
+
+    def test_redirect_target_cannot_be_chosen_by_the_request(self):
+        evil = "https%3A%2F%2Fevil.example%2F"
+        query = (f"code=c&next={evil}&redirect={evil}&redirect_uri={evil}"
+                 f"&return_to={evil}&url={evil}&frontend_url={evil}")
+        response = self.callback(make_credentials(), query=query)
+        self.assertEqual(response.headers["location"], SUCCESS_URL)
+        response = self.client.get(
+            "/auth/google/callback?error=access_denied",
+            headers={"Host": "evil.example", "X-Forwarded-Host": "evil.example",
+                     "Referer": "https://evil.example/"},
+            follow_redirects=False,
+        )
+        self.assertTrue(response.headers["location"].startswith(f"{FRONTEND}/?"))
+
+    def test_invalid_frontend_url_falls_back_to_json(self):
+        for value in ("javascript:alert(1)", "//evil.example", "ftp://x.example",
+                      "https://", "https://a.example/?next=x", "https://u@a.example"):
+            with self.subTest(value=value), \
+                    mock.patch.object(settings, "frontend_url", value):
+                self.assertEqual(settings.frontend_redirect_base, "")
+                response = self.callback(make_credentials())
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["authenticated"])
+
+
+class FrontendUrlSettingTests(unittest.TestCase):
+    def test_normalization(self):
+        for value, expected in (
+            ("", ""),
+            ("  https://site.netlify.app/  ", "https://site.netlify.app"),
+            ('"https://site.netlify.app"', "https://site.netlify.app"),
+            ("http://localhost:5173", "http://localhost:5173"),
+            ("https://example.com/app/", "https://example.com/app"),
+            ("site.netlify.app", ""),
+        ):
+            with self.subTest(value=value), mock.patch.object(settings, "frontend_url", value):
+                self.assertEqual(settings.frontend_redirect_base, expected)
 
 
 # --- 2. Restart ---------------------------------------------------------------------------

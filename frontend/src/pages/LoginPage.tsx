@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState } from 'react'
 import { MessagesSquare, ShieldCheck, Sparkles, ThumbsUp, Timer } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { goToGoogleSignIn } from '../lib/googleAuth'
 import { useToast } from '../context/ToastContext'
 
 const FEATURES = [
@@ -25,49 +25,19 @@ const FEATURES = [
   },
 ]
 
-export function LoginPage({ onAuthenticated }: { onAuthenticated: () => void }) {
+/** `error`: why the last Google sign-in did not connect, shown until retried. */
+export function LoginPage({ error }: { error?: string | null }) {
   const toast = useToast()
-  const navigate = useNavigate()
   const [connecting, setConnecting] = useState(false)
-  const pollRef = useRef<number | null>(null)
 
-  useEffect(() => {
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current)
-    }
-  }, [])
-
-  const startPolling = () => {
-    if (pollRef.current) window.clearInterval(pollRef.current)
-    let elapsed = 0
-    pollRef.current = window.setInterval(async () => {
-      elapsed += 2
-      try {
-        const status = await api.getAuthStatus()
-        if (status.authenticated) {
-          if (pollRef.current) window.clearInterval(pollRef.current)
-          setConnecting(false)
-          toast.success('Connected to Google Business Profile.')
-          onAuthenticated()
-          navigate('/select-business')
-        }
-      } catch {
-        /* keep polling */
-      }
-      if (elapsed >= 180 && pollRef.current) {
-        window.clearInterval(pollRef.current)
-        setConnecting(false)
-      }
-    }, 2000)
-  }
-
+  // The page is left for Google in this tab; the backend's OAuth callback
+  // brings the browser back to the app, which then checks the connection.
   const handleSignIn = async () => {
     setConnecting(true)
     try {
       const { authorization_url, warning } = await api.getAuthorizeUrl()
       if (warning) toast.info(warning)
-      window.open(authorization_url, '_blank', 'noopener,noreferrer')
-      startPolling()
+      goToGoogleSignIn(authorization_url)
     } catch (err) {
       setConnecting(false)
       toast.error(
@@ -75,20 +45,6 @@ export function LoginPage({ onAuthenticated }: { onAuthenticated: () => void }) 
           ? err.message
           : 'Could not start Google sign-in. Please try again.',
       )
-    }
-  }
-
-  const handleAlreadyConnected = async () => {
-    try {
-      const status = await api.getAuthStatus()
-      if (status.authenticated) {
-        onAuthenticated()
-        navigate('/select-business')
-      } else {
-        toast.info('Not connected yet. Finish the Google sign-in in the other tab.')
-      }
-    } catch {
-      toast.error('Could not verify the connection. Please try again.')
     }
   }
 
@@ -125,15 +81,24 @@ export function LoginPage({ onAuthenticated }: { onAuthenticated: () => void }) 
             ))}
           </div>
 
+          {error && (
+            <p
+              role="alert"
+              className="mt-8 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
+            >
+              {error}
+            </p>
+          )}
+
           <button
             onClick={handleSignIn}
             disabled={connecting}
-            className="btn-primary mt-8 w-full py-3 text-[15px]"
+            className={`btn-primary w-full py-3 text-[15px] ${error ? 'mt-4' : 'mt-8'}`}
           >
             {connecting ? (
               <>
                 <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-                Waiting for Google…
+                Redirecting to Google…
               </>
             ) : (
               <>
@@ -142,15 +107,6 @@ export function LoginPage({ onAuthenticated }: { onAuthenticated: () => void }) 
               </>
             )}
           </button>
-
-          {connecting && (
-            <button
-              onClick={handleAlreadyConnected}
-              className="mt-3 w-full text-center text-sm font-medium text-brand-600 hover:text-brand-700"
-            >
-              I’ve finished connecting
-            </button>
-          )}
 
           <p className="mt-6 flex items-center justify-center gap-1.5 text-center text-xs text-slate-400">
             <ShieldCheck className="h-3.5 w-3.5" />

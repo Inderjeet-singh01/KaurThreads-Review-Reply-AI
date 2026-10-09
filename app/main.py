@@ -76,6 +76,18 @@ if settings.google_token_file.strip():
         "in the database. Import an existing token once with "
         "`python -m app.auth.import_token`, then remove GOOGLE_TOKEN_FILE"
     )
+if not settings.frontend_url.strip():
+    logger.warning(
+        "FRONTEND_URL is not set: after Google sign-in the OAuth callback answers JSON "
+        "instead of returning the browser to the frontend"
+    )
+elif not settings.frontend_redirect_base:
+    logger.error(
+        "FRONTEND_URL is not a valid absolute http(s) URL (no query or fragment); "
+        "the OAuth callback answers JSON until it is fixed"
+    )
+else:
+    logger.info("After Google sign-in the browser returns to %s", settings.frontend_redirect_base)
 if settings.auto_reply_enabled and not pubsub_auth_configured():
     logger.warning(
         "AUTO_REPLY_ENABLED is true but PUBSUB_PUSH_AUDIENCE / "

@@ -9,6 +9,7 @@ named by DATABASE_URL (see app/auth/token_store.py).
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -139,6 +140,36 @@ class Settings(BaseSettings):
             for origin in self.cors_allow_origins.split(",")
             if origin.strip()
         ]
+
+    # Base URL of the deployed frontend (e.g. https://your-site.netlify.app).
+    # After Google sign-in the OAuth callback redirects the browser here. The
+    # destination is never taken from the request, so the callback cannot be
+    # used as an open redirect. Empty = the callback answers JSON (API-only use).
+    frontend_url: str = ""
+
+    @property
+    def frontend_redirect_base(self) -> str:
+        """FRONTEND_URL without a trailing slash, or "" when unset or invalid.
+
+        Only an absolute http(s) URL with a host and no query, fragment or
+        user info is accepted.
+        """
+        value = self.frontend_url.strip().strip("'\"").strip().rstrip("/")
+        if not value:
+            return ""
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            return ""
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or "@" in parts.netloc
+            or parts.query
+            or parts.fragment
+        ):
+            return ""
+        return value
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),

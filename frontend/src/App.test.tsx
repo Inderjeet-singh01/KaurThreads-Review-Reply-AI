@@ -1,12 +1,21 @@
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import App from './App'
 import { BusinessProvider } from './context/BusinessContext'
 import { ToastProvider } from './context/ToastContext'
 import { discardPrefetchedReviews } from './lib/api'
+import { CONNECTED_MESSAGE, NOT_VERIFIED_MESSAGE, goToGoogleSignIn } from './lib/googleAuth'
 import type { AuthStatus, Review } from './lib/types'
+
+// jsdom cannot leave the page; record the navigation to Google instead.
+vi.mock('./lib/googleAuth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./lib/googleAuth')>()),
+  goToGoogleSignIn: vi.fn(),
+}))
+
+const GOOGLE_URL = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=s'
 
 // The real API layer runs; only the network (fetch) is faked, so request
 // de-duplication and the review prefetch are exercised too.
@@ -60,6 +69,7 @@ beforeEach(() => {
       const path = new URL(url).pathname
       calls.push(path)
       if (path === '/auth/google/status') return statusResponder()
+      if (path === '/auth/google/authorize') return json({ authorization_url: GOOGLE_URL, state: 's' })
       if (path === '/reviews/all') return json(REVIEWS)
       return json({ detail: 'not mocked' }, 404)
     }),
@@ -68,11 +78,17 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  vi.mocked(goToGoogleSignIn).mockClear()
   vi.unstubAllGlobals()
   vi.useRealTimers()
   localStorage.clear()
   discardPrefetchedReviews()
 })
+
+function CurrentLocation() {
+  const { pathname, search } = useLocation()
+  return <span data-testid="location">{pathname + search}</span>
+}
 
 function renderApp(path = '/replied', { strict = false } = {}) {
   const tree = (
@@ -80,6 +96,7 @@ function renderApp(path = '/replied', { strict = false } = {}) {
       <ToastProvider>
         <BusinessProvider>
           <App retryDelaysMs={[0, 0]} />
+          <CurrentLocation />
         </BusinessProvider>
       </ToastProvider>
     </MemoryRouter>
@@ -189,5 +206,87 @@ describe('App startup', () => {
     renderApp('/login')
     await screen.findByText('Manage Your Google Reviews with AI')
     expect(count('/reviews/all')).toBe(0)
+  })
+})
+
+describe('Google sign-in', () => {
+  const location = () => screen.getByTestId('location').textContent
+
+  it('leaves for Google in the same tab (no popup, no polling)', async () => {
+    const open = vi.fn()
+    vi.stubGlobal('open', open)
+    statusResponder = () => json({ authenticated: false })
+    renderApp('/login')
+    fireEvent.click(await screen.findByRole('button', { name: /sign in with google/i }))
+    await waitFor(() => expect(goToGoogleSignIn).toHaveBeenCalledWith(GOOGLE_URL))
+    expect(open).not.toHaveBeenCalled()
+    expect(count('/auth/google/status')).toBe(1)
+  })
+
+  it('on return, verifies with the status endpoint and opens the app', async () => {
+    renderApp('/?google_auth=success')
+    expect(await screen.findByText(CONNECTED_MESSAGE)).toBeTruthy()
+    await waitFor(() => expect(location()).toBe('/dashboard'))
+    expect(count('/auth/google/status')).toBe(1)
+  })
+
+  it('removes the sign-in parameters from the URL and keeps others', async () => {
+    const status = deferred<Response>()
+    statusResponder = () => status.promise
+    renderApp('/?google_auth=success&ref=mail')
+    await waitFor(() => expect(location()).toBe('/?ref=mail'))
+    await act(async () => status.resolve(json({ authenticated: true })))
+    expect(await screen.findByText(CONNECTED_MESSAGE)).toBeTruthy()
+  })
+
+  it('reports success once under React StrictMode', async () => {
+    renderApp('/?google_auth=success', { strict: true })
+    await screen.findByText(CONNECTED_MESSAGE)
+    await waitFor(() => expect(location()).toBe('/dashboard'))
+    expect(screen.getAllByText(CONNECTED_MESSAGE)).toHaveLength(1)
+    expect(count('/auth/google/status')).toBe(1)
+  })
+
+  it('does not trust ?google_auth=success when the server says not connected', async () => {
+    statusResponder = () => json({ authenticated: false, retryable: false })
+    renderApp('/?google_auth=success')
+    expect((await screen.findByRole('alert')).textContent).toBe(NOT_VERIFIED_MESSAGE)
+    expect(screen.getByText('Manage Your Google Reviews with AI')).toBeTruthy()
+    expect(screen.queryByText(CONNECTED_MESSAGE)).toBeNull()
+    expect(location()).toBe('/login')
+  })
+
+  it('waits out a temporary outage instead of signing the user out', async () => {
+    let attempts = 0
+    statusResponder = () => {
+      attempts += 1
+      if (attempts === 1) throw new TypeError('Failed to fetch')
+      return json({ authenticated: true })
+    }
+    renderApp('/?google_auth=success')
+    expect(await screen.findByText(CONNECTED_MESSAGE)).toBeTruthy()
+    expect(attempts).toBe(2)
+    expect(screen.queryByText(NOT_VERIFIED_MESSAGE)).toBeNull()
+  })
+
+  it('shows why sign-in failed on the login page', async () => {
+    statusResponder = () => json({ authenticated: false })
+    renderApp('/?google_auth=error&reason=access_denied')
+    expect((await screen.findByRole('alert')).textContent).toContain('cancelled')
+    expect(location()).toBe('/login')
+  })
+
+  it('never displays text taken from the URL', async () => {
+    statusResponder = () => json({ authenticated: false })
+    renderApp('/?google_auth=error&reason=%3Cb%3Eevil%20text%3C%2Fb%3E')
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Google sign-in could not be completed. Please try again.')
+    expect(screen.queryByText(/evil text/)).toBeNull()
+  })
+
+  it('a failed reconnect keeps an existing connection', async () => {
+    renderApp('/?google_auth=error&reason=storage_unavailable')
+    expect(await screen.findByText(/could not save the connection/)).toBeTruthy()
+    await waitFor(() => expect(location()).toBe('/dashboard'))
   })
 })

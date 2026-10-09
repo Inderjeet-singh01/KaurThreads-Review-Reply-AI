@@ -20,8 +20,10 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -95,9 +97,34 @@ def credentials_generation() -> int:
 class GoogleOAuthError(Exception):
     """Google OAuth is missing, unusable, or failed."""
 
+    # Fixed code sent to the frontend when the OAuth callback fails (never the
+    # message, which may contain details not meant for a URL).
+    reason = "oauth_failed"
+
 
 class GoogleOAuthNotConfiguredError(GoogleOAuthError):
     """OAuth client settings are not present in the environment / .env."""
+
+    reason = "not_configured"
+
+
+class GoogleOAuthStateError(GoogleOAuthError):
+    """The OAuth callback's state does not match the flow that was started."""
+
+    reason = "state_mismatch"
+
+
+class GoogleOAuthDeniedError(GoogleOAuthError):
+    """Google returned to the callback without an authorization code
+    (the user cancelled, or Google reported an error)."""
+
+    reason = "access_denied"
+
+
+class GoogleOAuthNoRefreshTokenError(GoogleOAuthError):
+    """Google issued credentials without a refresh token."""
+
+    reason = "no_refresh_token"
 
 
 class GoogleTokenRefreshUnavailableError(GoogleOAuthError):
@@ -111,6 +138,8 @@ class GoogleTokenStoreError(GoogleOAuthError):
     Not an authentication failure: re-authorizing does not help, so the API
     answers 503 instead of 401.
     """
+
+    reason = "storage_unavailable"
 
 
 def _require_oauth_config() -> None:
@@ -184,7 +213,7 @@ def complete_authorization(code: str, state: str) -> Credentials:
     global _current_flow
     if _current_state is not None and state != _current_state:
         logger.warning("OAuth callback state did not match the started flow")
-        raise GoogleOAuthError(
+        raise GoogleOAuthStateError(
             "OAuth state mismatch. Open the authorization URL again and "
             "complete the flow."
         )
@@ -214,7 +243,7 @@ def complete_authorization(code: str, state: str) -> Credentials:
         # Storing it would replace a working refresh token with credentials
         # that stop working within the hour.
         logger.error("Google OAuth returned no refresh token; nothing was stored")
-        raise GoogleOAuthError(
+        raise GoogleOAuthNoRefreshTokenError(
             "Google did not return a refresh token, so the app could not stay "
             "connected. Remove this app's access at "
             "https://myaccount.google.com/permissions and authorize again. "
@@ -593,16 +622,37 @@ def authorize() -> dict[str, str]:
     return result
 
 
-@router.get("/callback")
+@router.get("/callback", response_model=None)
 def callback(
-    code: str = Query(..., description="Authorization code returned by Google."),
+    code: str = Query("", description="Authorization code returned by Google."),
     state: str = Query("", description="State value returned by Google."),
-) -> dict[str, Any]:
-    """OAuth callback: exchange the code for credentials and store them."""
+    error: str = Query("", description="Error returned by Google (e.g. access_denied)."),
+) -> dict[str, Any] | RedirectResponse:
+    """OAuth callback: exchange the code for credentials and store them.
+
+    With ``FRONTEND_URL`` set, the browser is then redirected (303) to the
+    frontend: ``/?google_auth=success`` only after the credentials were
+    saved, otherwise ``/?google_auth=error&reason=<code>``. The destination
+    comes from configuration only, and no code or token is put in the URL.
+    Without ``FRONTEND_URL`` the outcome is answered as JSON.
+    """
+    frontend = settings.frontend_redirect_base
     try:
+        if error or not code:
+            logger.warning(
+                "Google OAuth callback without an authorization code (error=%r)", error[:64]
+            )
+            raise GoogleOAuthDeniedError(
+                "Google sign-in was cancelled or failed, so nothing was stored. "
+                "Authorize again via GET /auth/google/authorize."
+            )
         complete_authorization(code, state)
     except GoogleOAuthError as exc:
+        if frontend:
+            return _frontend_redirect(frontend, google_auth="error", reason=exc.reason)
         raise _oauth_http_error(exc) from exc
+    if frontend:
+        return _frontend_redirect(frontend, google_auth="success")
     return {
         "authenticated": True,
         "message": (
@@ -630,6 +680,11 @@ def logout() -> dict[str, Any]:
             clear_credentials_cache()
     logger.info("Google account disconnected (stored credentials removed=%s)", existed)
     return {"authenticated": False, "message": "Google account disconnected."}
+
+
+def _frontend_redirect(base: str, **params: str) -> RedirectResponse:
+    """303 to the configured frontend's entry route; fixed parameters only."""
+    return RedirectResponse(f"{base}/?{urlencode(params)}", status_code=303)
 
 
 def _oauth_http_error(exc: GoogleOAuthError) -> HTTPException:

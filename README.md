@@ -166,6 +166,7 @@ Copy `.env.example` to `.env` and fill it in:
 | `GOOGLE_CLIENT_ID` | yes | OAuth client ID (Web application). |
 | `GOOGLE_CLIENT_SECRET` | yes | OAuth client secret. |
 | `GOOGLE_REDIRECT_URI` | yes | Must match the redirect URI registered with the OAuth client. Default `http://localhost:8000/auth/google/callback`. |
+| `FRONTEND_URL` | for the frontend | Base URL of the frontend (e.g. `https://your-site.netlify.app`). After Google sign-in the callback redirects the browser here. Empty = the callback answers JSON. |
 | `GROQ_API_KEY` | yes* | Groq API key from <https://console.groq.com/keys> (primary provider). |
 | `GEMINI_API_KEY` | yes* | Gemini API key from <https://aistudio.google.com/apikey> (fallback for generation and Check Reply). |
 | `GOOGLE_LOCATION_ID` | no | Pin a specific Business Profile location (bare location ID or `accounts/{account}/locations/{location}`). Default: first location of the first account. |
@@ -246,7 +247,11 @@ uvicorn app.main:app --reload --port 8000
 3. Google redirects the browser to
    `http://localhost:8000/auth/google/callback?code=...&state=...` — the app
    exchanges the code for a token (with refresh token) and stores it in the
-   database. The callback page shows the result.
+   database. With `FRONTEND_URL` set, the browser is then sent (303) to
+   `FRONTEND_URL/?google_auth=success` — only after the credentials were
+   saved — or to `FRONTEND_URL/?google_auth=error&reason=<code>`, where the
+   frontend confirms the connection with `GET /auth/google/status`. Without
+   `FRONTEND_URL` the callback page shows the result as JSON.
 4. `GET /auth/google/status` now shows `authenticated: true`.
 
 Notes:
@@ -639,6 +644,7 @@ Replace `PROJECT_ID`, `PROJECT_NUMBER` and `YOUR-RENDER-BACKEND-DOMAIN`.
 | `PUBSUB_PUSH_SERVICE_ACCOUNT` | `gbp-reviews-push@PROJECT_ID.iam.gserviceaccount.com` |
 | `DATABASE_URL` | Neon connection string (see 13.6) |
 | `GOOGLE_TOKEN_ENCRYPTION_KEY` | Fernet key (see section 4 and 13.6) |
+| `FRONTEND_URL` | the deployed frontend's URL (e.g. `https://your-site.netlify.app`); also list its origin in `CORS_ALLOW_ORIGINS` |
 | `AUTO_REPLY_ENABLED` | `false` → then `true` (see 13.7) |
 | `AUTO_REPLY_DRY_RUN` | `true` first, `false` once dry runs look right |
 | `AUTO_REPLY_LOCATION_IDS` | optional allowlist |

@@ -1,8 +1,15 @@
-import { useEffect, useState } from 'react'
-import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { discardPrefetchedReviews, prefetchAllReviews } from './lib/api'
 import { AUTH_RETRY_DELAYS_MS, checkAuth } from './lib/authCheck'
+import {
+  CONNECTED_MESSAGE,
+  NOT_VERIFIED_MESSAGE,
+  parseGoogleAuthReturn,
+  withoutGoogleAuthParams,
+} from './lib/googleAuth'
 import { useBusiness } from './context/BusinessContext'
+import { useToast } from './context/ToastContext'
 import { ReviewsProvider } from './context/ReviewsContext'
 import { AppShell } from './components/AppShell'
 import { StartupScreen } from './components/StartupScreen'
@@ -23,8 +30,22 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
   const [auth, setAuth] = useState<AuthState>('checking')
   const [unavailableMessage, setUnavailableMessage] = useState('')
   const [checkId, setCheckId] = useState(0)
+  const [loginError, setLoginError] = useState<string | null>(null)
   const { business } = useBusiness()
-  const { pathname } = useLocation()
+  const { pathname, search, hash } = useLocation()
+  const navigate = useNavigate()
+  const toast = useToast()
+  // Set when this page load is the return from Google sign-in (read once).
+  const [googleAuthReturn] = useState(() => parseGoogleAuthReturn(search))
+  const googleAuthReturnHandled = useRef(false)
+
+  useEffect(() => {
+    // Drop the one-time sign-in parameters from the address bar.
+    if (googleAuthReturn) {
+      navigate({ pathname, search: withoutGoogleAuthParams(search), hash }, { replace: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -38,6 +59,19 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
       if (cancelled) return
       if (result.state !== 'authed') discardPrefetchedReviews()
       if (result.state === 'unavailable') setUnavailableMessage(result.message)
+      // Report a sign-in return once the server has answered; the URL never
+      // decides on its own whether Google is connected.
+      if (googleAuthReturn && result.state !== 'unavailable' && !googleAuthReturnHandled.current) {
+        googleAuthReturnHandled.current = true
+        const authed = result.state === 'authed'
+        if (googleAuthReturn.outcome === 'success' && authed) toast.success(CONNECTED_MESSAGE)
+        else {
+          const message =
+            googleAuthReturn.outcome === 'error' ? googleAuthReturn.message : NOT_VERIFIED_MESSAGE
+          if (authed) toast.error(message)
+          else setLoginError(message)
+        }
+      }
       setAuth(result.state)
     })
     return () => {
@@ -48,7 +82,6 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
   }, [checkId])
 
   const authed = auth === 'authed'
-  const setAuthed = (value: boolean) => setAuth(value ? 'authed' : 'unauthed')
   const onAuthExpired = () => setAuth('unauthed')
 
   if (auth === 'checking') return <StartupScreen />
@@ -64,7 +97,7 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
           authed ? (
             <Navigate to="/select-business" replace />
           ) : (
-            <LoginPage onAuthenticated={() => setAuthed(true)} />
+            <LoginPage error={loginError} />
           )
         }
       />
