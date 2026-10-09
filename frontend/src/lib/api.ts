@@ -70,7 +70,12 @@ async function request<T>(
   try {
     response = await fetch(`${BASE_URL}${path}`, {
       ...options,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
+      // Content-Type only when there is a body: on a GET it would turn every
+      // cross-origin call into a "non-simple" request, costing an extra CORS
+      // preflight (OPTIONS) round trip before the real request.
+      headers: options.body
+        ? { 'Content-Type': 'application/json', ...options.headers }
+        : options.headers,
     })
   } catch {
     // Network error / server down / CORS failure.
@@ -106,9 +111,33 @@ function withLocation(path: string, locationId?: string | null): string {
   return `${path}${sep}location_id=${encodeURIComponent(locationId)}`
 }
 
+// Concurrent status checks (React StrictMode's double effect in development,
+// the login page polling while the app checks) share one request. Nothing is
+// cached: every check after the previous one finished asks the server again.
+let authStatusInFlight: Promise<AuthStatus> | null = null
+
+// Longer than a Render free instance takes to wake, so a sleeping backend is
+// waited for, but a request lost in the network cannot block every later
+// check (they share it) forever. A timeout surfaces as a retryable error.
+export const AUTH_STATUS_TIMEOUT_MS = 75_000
+
+function getAuthStatusShared(): Promise<AuthStatus> {
+  if (!authStatusInFlight) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), AUTH_STATUS_TIMEOUT_MS)
+    authStatusInFlight = request<AuthStatus>('/auth/google/status', {
+      signal: controller.signal,
+    }).finally(() => {
+      clearTimeout(timer)
+      authStatusInFlight = null
+    })
+  }
+  return authStatusInFlight
+}
+
 export const api = {
   // --- Auth ---------------------------------------------------------------
-  getAuthStatus: () => request<AuthStatus>('/auth/google/status'),
+  getAuthStatus: getAuthStatusShared,
   getAuthorizeUrl: () => request<AuthorizeResponse>('/auth/google/authorize'),
   logout: () => request<{ authenticated: boolean; message: string }>(
     '/auth/google/logout',
@@ -177,4 +206,47 @@ export const api = {
       withLocation(`/reviews/${encodeURIComponent(reviewId)}/publish`, locationId),
       { method: 'POST', body: JSON.stringify({ reply }) },
     ),
+}
+
+// --- Startup prefetch ------------------------------------------------------
+// The app shell needs /auth/google/status before it may show anything
+// protected. The review list is independent of that answer on the server
+// (the reviews endpoint checks the credentials itself), so App starts it in
+// parallel and ReviewsProvider picks it up — only after authentication was
+// confirmed, so nothing is displayed earlier. Unused or stale prefetches are
+// dropped.
+const PREFETCH_MAX_AGE_MS = 30_000
+
+let reviewsPrefetch: { locationId: string | null; at: number; promise: Promise<Review[]> } | null =
+  null
+
+export function prefetchAllReviews(locationId: string | null): void {
+  if (
+    reviewsPrefetch &&
+    reviewsPrefetch.locationId === locationId &&
+    Date.now() - reviewsPrefetch.at < PREFETCH_MAX_AGE_MS
+  ) {
+    return // already running (e.g. StrictMode's second effect run)
+  }
+  const promise = api.listAllReviews(locationId)
+  promise.catch(() => undefined) // consumed (or retried) by ReviewsProvider
+  reviewsPrefetch = { locationId, at: Date.now(), promise }
+}
+
+/** The prefetched list for this location, at most once; null when none. */
+export function takePrefetchedReviews(locationId: string | null): Promise<Review[]> | null {
+  const prefetch = reviewsPrefetch
+  reviewsPrefetch = null
+  if (
+    !prefetch ||
+    prefetch.locationId !== locationId ||
+    Date.now() - prefetch.at >= PREFETCH_MAX_AGE_MS
+  ) {
+    return null
+  }
+  return prefetch.promise
+}
+
+export function discardPrefetchedReviews(): void {
+  reviewsPrefetch = null
 }

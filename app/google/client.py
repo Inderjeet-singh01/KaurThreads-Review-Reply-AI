@@ -30,8 +30,10 @@ from urllib.parse import urlsplit
 import requests
 from google.oauth2.credentials import Credentials
 
+from app import timing
 from app.auth.google_oauth import (
     GoogleOAuthError,
+    credentials_generation,
     force_refresh_credentials,
     load_credentials,
     refresh_credentials_if_needed,
@@ -64,14 +66,18 @@ def get_google_client() -> "GoogleBusinessClient":
     Raises GoogleOAuthError when the OAuth flow has not been completed or the
     stored credentials are unusable.
     """
-    return GoogleBusinessClient(load_credentials())
+    credentials = load_credentials()
+    return GoogleBusinessClient(credentials, credentials_generation=credentials_generation())
 
 
 class GoogleBusinessClient:
     """Thin authenticated client for the Business Profile REST APIs."""
 
-    def __init__(self, credentials: Credentials):
+    def __init__(self, credentials: Credentials, credentials_generation: int | None = None):
         self._credentials = credentials
+        # Identifies the authorization this client uses; lets callers cache
+        # account-derived data (e.g. the location resource) per authorization.
+        self.credentials_generation = credentials_generation
 
     # ------------------------------------------------------------------
     # Transport
@@ -105,15 +111,17 @@ class GoogleBusinessClient:
         the request retried. Any other error status raises GoogleAPIError
         with a safe message (no tokens or credential data are included).
         """
+        headers = self._headers()
         try:
-            response = requests.request(
-                method,
-                url,
-                headers=self._headers(),
-                json=json_body,
-                params=params,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
+            with timing.measure("google"):
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json_body,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
         except requests.RequestException as exc:
             logger.error("Google API request failed (%s %s): %s", method, url, exc)
             raise GoogleAPIError(f"Could not reach the Google API: {exc}") from exc

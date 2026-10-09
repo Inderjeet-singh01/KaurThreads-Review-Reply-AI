@@ -11,7 +11,11 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from app.auth.google_oauth import GoogleOAuthError, GoogleTokenStoreError
+from app.auth.google_oauth import (
+    GoogleOAuthError,
+    GoogleTokenRefreshUnavailableError,
+    GoogleTokenStoreError,
+)
 from app.google.client import GoogleAPIError
 from app.google.reviews import (
     GoogleReviewError,
@@ -26,8 +30,8 @@ router = APIRouter(prefix="/locations", tags=["Locations"])
 
 
 def _to_http_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, GoogleTokenStoreError):
-        # Credential database unavailable: not a reason to re-authenticate.
+    if isinstance(exc, (GoogleTokenStoreError, GoogleTokenRefreshUnavailableError)):
+        # Database or Google temporarily unavailable: not a reason to re-authenticate.
         return HTTPException(status_code=503, detail=str(exc))
     if isinstance(exc, GoogleOAuthError):
         return HTTPException(status_code=401, detail=str(exc))

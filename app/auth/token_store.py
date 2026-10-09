@@ -34,6 +34,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
+from app import timing
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -80,24 +81,22 @@ class TokenStoreNotConfiguredError(TokenStoreError):
     """DATABASE_URL or GOOGLE_TOKEN_ENCRYPTION_KEY is missing or invalid."""
 
 
+class CredentialsUnreadableError(TokenStoreError):
+    """The database answered, but the stored row cannot be decrypted/parsed."""
+
+
 @dataclass(frozen=True)
 class StoredCredentials:
-    """A decrypted credentials row. ``info`` holds secrets — never log it."""
+    """A decrypted credentials row. ``info`` holds secrets — never log it.
+
+    ``version``, ``updated_at`` and ``scopes`` are non-secret metadata (used
+    by the status diagnostics).
+    """
 
     info: dict[str, Any]
     version: int
     updated_at: datetime | None
-
-
-@dataclass(frozen=True)
-class StoredMetadata:
-    """Non-secret facts about the stored row (for status diagnostics)."""
-
-    version: int
-    token_expiry: datetime | None
     scopes: str
-    created_at: datetime | None
-    updated_at: datetime | None
 
 
 _lock = threading.Lock()
@@ -216,7 +215,13 @@ def _get_pool():
                 check=ConnectionPool.check_connection,
                 # prepare_threshold=None: no server-side prepared statements,
                 # which Neon's PgBouncer (-pooler host) may not support.
-                kwargs={"connect_timeout": CONNECT_TIMEOUT_SECONDS, "prepare_threshold": None},
+                # autocommit: every operation is one statement, so it costs a
+                # single round trip instead of BEGIN + statement + COMMIT.
+                kwargs={
+                    "connect_timeout": CONNECT_TIMEOUT_SECONDS,
+                    "prepare_threshold": None,
+                    "autocommit": True,
+                },
                 open=False,
                 name="google-oauth-credentials",
             )
@@ -229,11 +234,11 @@ def _get_pool():
 
 
 def _run(action: str, sql: str, params: tuple = ()):
-    """Execute one statement in its own transaction; return the first row."""
+    """Execute one (atomic) statement and return the first row."""
     pool = _get_pool()
     ensure_schema()
     try:
-        with pool.connection() as conn:
+        with timing.measure("db"), pool.connection() as conn:
             return conn.execute(sql, params).fetchone()
     except Exception as exc:
         raise _db_error(action, exc) from exc
@@ -246,7 +251,7 @@ def ensure_schema() -> None:
         return
     pool = _get_pool()
     try:
-        with pool.connection() as conn:
+        with pool.connection() as conn, conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
             conn.execute(_SCHEMA_SQL)
     except Exception as exc:
@@ -275,16 +280,16 @@ def _decrypt(ciphertext: str) -> dict[str, Any]:
     try:
         data = json.loads(_fernet().decrypt(ciphertext.encode()))
     except InvalidToken as exc:
-        raise TokenStoreError(
+        raise CredentialsUnreadableError(
             "The stored Google credentials could not be decrypted with "
             "GOOGLE_TOKEN_ENCRYPTION_KEY (the key changed?). Restore the "
             "previous key (comma-separate old and new keys to rotate) or "
             "authorize again via GET /auth/google/authorize."
         ) from exc
     except ValueError as exc:
-        raise TokenStoreError("The stored Google credentials are corrupted.") from exc
+        raise CredentialsUnreadableError("The stored Google credentials are corrupted.") from exc
     if not isinstance(data, dict):
-        raise TokenStoreError("The stored Google credentials are corrupted.")
+        raise CredentialsUnreadableError("The stored Google credentials are corrupted.")
     return data
 
 
@@ -303,26 +308,18 @@ def _columns(info: dict[str, Any]) -> tuple[str, str | None, str]:
 # Public operations
 # ---------------------------------------------------------------------------
 def load() -> StoredCredentials | None:
-    """The stored credentials, or None when OAuth has not been completed."""
+    """The stored credentials and their metadata (one query), or None when
+    OAuth has not been completed."""
     row = _run(
         "loading Google credentials",
-        f"SELECT encrypted_credentials, version, updated_at FROM {TABLE} WHERE id = %s",
+        f"SELECT encrypted_credentials, version, updated_at, scopes FROM {TABLE} WHERE id = %s",
         (CREDENTIALS_ID,),
     )
     if row is None:
         return None
-    return StoredCredentials(info=_decrypt(row[0]), version=row[1], updated_at=row[2])
-
-
-def metadata() -> StoredMetadata | None:
-    """Non-secret row metadata, without decrypting anything."""
-    row = _run(
-        "reading credential metadata",
-        f"SELECT version, token_expiry, scopes, created_at, updated_at FROM {TABLE} "
-        "WHERE id = %s",
-        (CREDENTIALS_ID,),
+    return StoredCredentials(
+        info=_decrypt(row[0]), version=row[1], updated_at=row[2], scopes=row[3]
     )
-    return StoredMetadata(*row) if row else None
 
 
 def save(info: dict[str, Any]) -> int:

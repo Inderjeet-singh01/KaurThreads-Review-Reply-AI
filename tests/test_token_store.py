@@ -296,9 +296,16 @@ class MissingConfigurationTests(ApiTestCase):
         from cryptography.fernet import Fernet
 
         with mock.patch.object(settings, "google_token_encryption_key", Fernet.generate_key().decode()):
-            with self.assertRaises(google_oauth.GoogleTokenStoreError) as ctx:
+            with self.assertRaises(google_oauth.GoogleOAuthError) as ctx:
                 google_oauth.load_credentials()
-        self.assertIn("could not be decrypted", str(ctx.exception))
+            # Authorizing again fixes it, so it is an auth error (401), not a 503.
+            self.assertNotIsInstance(ctx.exception, google_oauth.GoogleTokenStoreError)
+            self.assertIn("could not be decrypted", str(ctx.exception))
+            body = self.status()
+        self.assertFalse(body["authenticated"])
+        self.assertFalse(body["retryable"])
+        self.assertTrue(body["database_reachable"])
+        self.assertTrue(body["credentials_stored"])
 
     def test_key_rotation(self):
         google_oauth.save_credentials(make_credentials())

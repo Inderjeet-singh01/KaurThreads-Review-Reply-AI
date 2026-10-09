@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { ApiError, api } from '../lib/api'
+import { ApiError, api, takePrefetchedReviews } from '../lib/api'
 import type { Review, ReviewStats } from '../lib/types'
 import { useBusiness } from './BusinessContext'
 
@@ -77,7 +77,12 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
         setIsAuthError(false)
       }
       try {
-        const data = await api.listAllReviews(locationId)
+        // The first load may reuse the request App started in parallel with
+        // the auth check; if that one failed, fetch again.
+        const prefetched = silent ? null : takePrefetchedReviews(locationId)
+        const data = prefetched
+          ? await prefetched.catch(() => api.listAllReviews(locationId))
+          : await api.listAllReviews(locationId)
         if (current !== requestId.current) return
         setServerReviews(data)
         setError(null)

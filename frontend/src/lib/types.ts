@@ -61,6 +61,8 @@ export interface ReviewStats {
 export interface AuthStatus {
   authenticated: boolean
   reason?: string
+  /** True when the server could not check (database/Google unavailable). */
+  retryable?: boolean
   expires_at?: string | null
   token_file?: string
 }

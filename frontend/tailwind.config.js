@@ -47,10 +47,16 @@ export default {
           '0%': { opacity: '0', transform: 'translateX(16px)' },
           '100%': { opacity: '1', transform: 'translateX(0)' },
         },
+        // Startup screen progress bar (index.html + StartupScreen).
+        indeterminate: {
+          '0%': { transform: 'translateX(-100%)' },
+          '100%': { transform: 'translateX(300%)' },
+        },
       },
       animation: {
         'fade-in': 'fade-in 0.2s ease-out',
         'slide-in': 'slide-in 0.25s ease-out',
+        indeterminate: 'indeterminate 1.2s ease-in-out infinite',
       },
     },
   },

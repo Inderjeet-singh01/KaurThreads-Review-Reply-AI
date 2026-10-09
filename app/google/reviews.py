@@ -10,14 +10,17 @@ All review-related Google API calls and review business logic live here:
 * publishing the user-approved reply.
 
 Google is the source of truth for whether a review already has a business
-reply: nothing is stored or cached locally, every call reads the latest
-Google state.
+reply: reviews and replies are never cached, every call reads the latest
+Google state. Only the location's resource name (a stable id mapping) is
+cached briefly, see ``get_location_name``.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from typing import Any
 
 from app.config import settings
@@ -33,6 +36,8 @@ logger = logging.getLogger(__name__)
 STAR_RATING_TO_INT = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
 
 REVIEW_PAGE_SIZE = 50  # maximum page size accepted by the Reviews API
+# How long a resolved location resource name is reused (see get_location_name).
+LOCATION_CACHE_SECONDS = 600
 MAX_REPLY_BYTES = 4096  # maximum reply length accepted by the Reviews API
 
 
@@ -112,8 +117,50 @@ def _build_review_location_resource(account_name: str, location_name: str) -> st
 # ---------------------------------------------------------------------------
 # Location handling (single boutique location, Phase 1)
 # ---------------------------------------------------------------------------
+# (credentials generation, requested location) -> (monotonic time, resource)
+_location_cache: dict[tuple[int, str], tuple[float, str]] = {}
+_location_cache_lock = threading.Lock()
+
+
+def clear_location_cache() -> None:
+    with _location_cache_lock:
+        _location_cache.clear()
+
+
 def get_location_name(
     client: GoogleBusinessClient | None = None,
+    location_id: str | None = None,
+) -> str:
+    """The location's Reviews API resource name, cached for a few minutes.
+
+    Resolving it costs two sequential Google calls (accounts, then
+    locations) before every review listing, fetch and publish, while the
+    mapping from a location id to ``accounts/{a}/locations/{l}`` does not
+    change. It is reused for LOCATION_CACHE_SECONDS and only for the same
+    authorization (a new authorization or logout starts over). Google still
+    authorizes every review call, so access is never widened by the cache.
+    """
+    client = client or get_google_client()
+    generation = getattr(client, "credentials_generation", None)
+    if not isinstance(client, GoogleBusinessClient) or generation is None:
+        return _resolve_location_name(client, location_id)
+    key = (generation, (location_id or settings.google_location_id or "").strip())
+    now = time.monotonic()
+    with _location_cache_lock:
+        cached = _location_cache.get(key)
+    if cached and now - cached[0] < LOCATION_CACHE_SECONDS:
+        return cached[1]
+    resource = _resolve_location_name(client, location_id)
+    with _location_cache_lock:
+        # Entries of older authorizations can never be hit again.
+        for stale in [k for k in _location_cache if k[0] != generation]:
+            del _location_cache[stale]
+        _location_cache[key] = (now, resource)
+    return resource
+
+
+def _resolve_location_name(
+    client: GoogleBusinessClient,
     location_id: str | None = None,
 ) -> str:
     """Resolve the boutique's location name via the Business Profile APIs.
@@ -130,8 +177,6 @@ def get_location_name(
     ``locations/{location_id}`` — passing that straight to the v4 Reviews URL
     produces ``/v4/locations/{id}/reviews`` and Google answers 404.
     """
-    client = client or get_google_client()
-
     try:
         accounts_response = client.list_accounts()
     except GoogleAPIError as exc:
@@ -224,13 +269,18 @@ def get_reviews(
     logger.info("Reviews API resource: %s/reviews", location_name)
     reviews: list[dict[str, Any]] = []
     page_token: str | None = None
+    pages = 0
+    # Pages are fetched one after another: each needs the previous nextPageToken.
     while True:
         response = client.list_reviews(location_name, REVIEW_PAGE_SIZE, page_token)
+        pages += 1
         reviews.extend(response.get("reviews") or [])
         page_token = response.get("nextPageToken")
         if not page_token:
             break
-    logger.info("Fetched %d reviews for location %s", len(reviews), location_name)
+    logger.info(
+        "Fetched %d reviews (%d page(s)) for location %s", len(reviews), pages, location_name
+    )
     return reviews
 
 

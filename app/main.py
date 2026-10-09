@@ -7,14 +7,16 @@ lives in app/api, app/auth, app/google, and app/ai.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.automation import router as automation_router
 from app.api.locations import router as locations_router
 from app.api.reviews import router as reviews_router
+from app import timing
 from app.auth import token_store
 from app.auth.google_oauth import router as google_auth_router
 from app.config import settings
@@ -133,6 +135,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def request_timing(request: Request, call_next):
+    """Log each request's duration split into database / Google time.
+
+    Also returned as a Server-Timing header (DevTools -> Network -> Timing),
+    so a slow screen can be attributed to Neon, Google or the network.
+    Logs the method and path only — no query string, body or credentials.
+    """
+    recorder, token = timing.begin()
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    finally:
+        timing.end(token)
+    total_ms = (time.perf_counter() - start) * 1000
+    response.headers["Server-Timing"] = timing.server_timing(recorder, total_ms)
+    if request.method != "OPTIONS" and request.url.path != "/health":
+        logger.info(
+            "request %s %s -> %d in %.0f ms (%s)",
+            request.method, request.url.path, response.status_code, total_ms,
+            timing.summary(recorder),
+        )
+    return response
+
 
 app.include_router(google_auth_router)
 app.include_router(reviews_router)

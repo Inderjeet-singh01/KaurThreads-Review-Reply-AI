@@ -19,7 +19,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query
 from google.auth.exceptions import RefreshError
@@ -27,6 +27,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
+from app import timing
 from app.auth import token_store
 from app.config import (
     GOOGLE_AUTH_URL,
@@ -73,6 +74,22 @@ class _CacheEntry:
 # serializes loads and refreshes across the automation's worker threads.
 _credentials_lock = threading.RLock()
 _cache: _CacheEntry | None = None
+# Bumped whenever the cached credentials are replaced or dropped (new
+# authorization, logout, another instance's write), so caches derived from the
+# Google account (see app.google.reviews) never outlive the credentials.
+_generation = 0
+
+
+def _set_cache(entry: _CacheEntry | None) -> None:
+    """Replace the cached credentials (lock held)."""
+    global _cache, _generation
+    _cache = entry
+    _generation += 1
+
+
+def credentials_generation() -> int:
+    """Changes whenever different credentials are (or none is) in use."""
+    return _generation
 
 
 class GoogleOAuthError(Exception):
@@ -81,6 +98,11 @@ class GoogleOAuthError(Exception):
 
 class GoogleOAuthNotConfiguredError(GoogleOAuthError):
     """OAuth client settings are not present in the environment / .env."""
+
+
+class GoogleTokenRefreshUnavailableError(GoogleOAuthError):
+    """The access token could not be refreshed for a transient reason
+    (network, Google 5xx) — the stored credentials are still valid."""
 
 
 class GoogleTokenStoreError(GoogleOAuthError):
@@ -255,13 +277,12 @@ def save_credentials(credentials: Credentials) -> int:
     database is not configured or the write fails — there is deliberately no
     fallback to a local file.
     """
-    global _cache
     with _credentials_lock:
         try:
             version = token_store.save(_credentials_to_info(credentials))
         except token_store.TokenStoreError as exc:
             raise _store_error(exc) from exc
-        _cache = _CacheEntry(credentials, version, time.monotonic())
+        _set_cache(_CacheEntry(credentials, version, time.monotonic()))
     return version
 
 
@@ -310,7 +331,8 @@ def refresh_credentials_if_needed(credentials: Credentials) -> None:
     with _credentials_lock:
         if credentials.expired and credentials.refresh_token:
             logger.info("Google access token expired; refreshing it")
-            credentials.refresh(Request())
+            with timing.measure("oauth_refresh"):
+                credentials.refresh(Request())
             _persist_refreshed(credentials)
 
 
@@ -323,7 +345,8 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
         return False
     try:
         with _credentials_lock:
-            credentials.refresh(Request())
+            with timing.measure("oauth_refresh"):
+                credentials.refresh(Request())
             _persist_refreshed(credentials)
         logger.info("Google access token force-refreshed")
         return True
@@ -334,9 +357,8 @@ def force_refresh_credentials(credentials: Credentials) -> bool:
 
 def clear_credentials_cache() -> None:
     """Drop the in-memory credentials (logout, tests)."""
-    global _cache
     with _credentials_lock:
-        _cache = None
+        _set_cache(None)
 
 
 def load_credentials() -> Credentials:
@@ -351,20 +373,33 @@ def load_credentials() -> Credentials:
     is never a reason to re-authenticate: it is refreshed with the stored
     refresh token and the result saved.
     """
+    return _load_credentials(token_store.load)
+
+
+def _load_credentials(
+    fetch: Callable[[], token_store.StoredCredentials | None], *, force_check: bool = False
+) -> Credentials:
+    """load_credentials() with a custom database read (see get_auth_status)."""
     with _credentials_lock:
         entry = _cache
         now = time.monotonic()
-        if entry is None or now - entry.checked_at >= CACHE_RECHECK_SECONDS:
-            entry = _sync_with_database(entry, now)
+        if force_check or entry is None or now - entry.checked_at >= CACHE_RECHECK_SECONDS:
+            entry = _sync_with_database(entry, now, fetch)
         return _ensure_usable(entry)
 
 
-def _sync_with_database(entry: _CacheEntry | None, now: float) -> _CacheEntry:
+def _sync_with_database(
+    entry: _CacheEntry | None,
+    now: float,
+    fetch: Callable[[], token_store.StoredCredentials | None],
+) -> _CacheEntry:
     """Reconcile the cache with the stored row (lock held)."""
-    global _cache
     try:
-        stored = token_store.load()
+        stored = fetch()
     except token_store.TokenStoreError as exc:
+        if isinstance(exc, token_store.CredentialsUnreadableError):
+            # The database answered; authorizing again replaces the row.
+            raise GoogleOAuthError(str(exc)) from exc
         if entry is not None:
             # Keep working through a database outage with the credentials
             # already in memory; check again after the normal interval.
@@ -375,7 +410,7 @@ def _sync_with_database(entry: _CacheEntry | None, now: float) -> _CacheEntry:
             return entry
         raise _store_error(exc) from exc
     if stored is None:
-        _cache = None
+        _set_cache(None)
         raise GoogleOAuthError(
             "Google OAuth has not been completed yet: no Google credentials are "
             "stored in the database. Complete the flow via GET /auth/google/authorize."
@@ -388,10 +423,11 @@ def _sync_with_database(entry: _CacheEntry | None, now: float) -> _CacheEntry:
     try:
         credentials = _credentials_from_info(stored.info)
     except GoogleOAuthError:
-        _cache = None
+        _set_cache(None)
         raise
-    _cache = _CacheEntry(credentials, stored.version, now)
-    return _cache
+    new_entry = _CacheEntry(credentials, stored.version, now)
+    _set_cache(new_entry)
+    return new_entry
 
 
 def _ensure_usable(entry: _CacheEntry) -> Credentials:
@@ -411,7 +447,7 @@ def _ensure_usable(entry: _CacheEntry) -> Credentials:
         ) from exc
     except Exception as exc:
         logger.error("Google token refresh failed: %s", exc)
-        raise GoogleOAuthError(
+        raise GoogleTokenRefreshUnavailableError(
             "The Google access token expired and could not be refreshed "
             f"({type(exc).__name__}). This is usually temporary; try again shortly."
         ) from exc
@@ -423,8 +459,8 @@ def _ensure_usable(entry: _CacheEntry) -> Credentials:
     return credentials
 
 
-def token_storage_diagnostics() -> dict[str, Any]:
-    """Safe facts about the credential store — never credential values."""
+def _storage_configuration() -> dict[str, Any]:
+    """Safe configuration facts (no database access)."""
     info: dict[str, Any] = {
         "token_store": "postgresql",
         "database_configured": token_store.database_configured(),
@@ -433,21 +469,6 @@ def token_storage_diagnostics() -> dict[str, Any]:
     if settings.google_token_file.strip():
         # Kept compatible, but the file is no longer read or written.
         info["legacy_token_file_ignored"] = True
-    try:
-        metadata = token_store.metadata()
-    except token_store.TokenStoreError as exc:
-        if info["database_configured"] and info["encryption_key_configured"]:
-            info["database_reachable"] = False
-        info["storage_error"] = str(exc)
-        return info
-    info["database_reachable"] = True
-    info["credentials_stored"] = metadata is not None
-    if metadata is not None:
-        info["stored_version"] = metadata.version
-        info["stored_updated_at"] = (
-            metadata.updated_at.isoformat() if metadata.updated_at else None
-        )
-        info["stored_scopes"] = metadata.scopes.split()
     return info
 
 
@@ -466,14 +487,49 @@ def _verify_google_api() -> dict[str, Any]:
 def get_auth_status(verify: bool = False) -> dict[str, Any]:
     """Report whether the app currently holds usable Google credentials.
 
-    Always includes :func:`token_storage_diagnostics`. With ``verify`` a
-    live Google Business Profile call confirms the token actually works.
+    Always reads the database (a single query for the credentials and their
+    metadata), so a logout or new authorization made elsewhere is reflected
+    immediately; only when the database is unreachable are credentials
+    already in memory reported (with ``database_reachable: false``). Never
+    includes credential values. With ``verify`` a live Google Business
+    Profile call confirms the token actually works.
     """
-    diagnostics = token_storage_diagnostics()
+    diagnostics = _storage_configuration()
+
+    def fetch() -> token_store.StoredCredentials | None:
+        try:
+            stored = token_store.load()
+        except token_store.CredentialsUnreadableError as exc:
+            diagnostics.update(database_reachable=True, credentials_stored=True)
+            diagnostics["storage_error"] = str(exc)
+            raise
+        except token_store.TokenStoreError as exc:
+            if diagnostics["database_configured"] and diagnostics["encryption_key_configured"]:
+                diagnostics["database_reachable"] = False
+            diagnostics["storage_error"] = str(exc)
+            raise
+        diagnostics.update(database_reachable=True, credentials_stored=stored is not None)
+        if stored is not None:
+            diagnostics["stored_version"] = stored.version
+            diagnostics["stored_updated_at"] = (
+                stored.updated_at.isoformat() if stored.updated_at else None
+            )
+            diagnostics["stored_scopes"] = stored.scopes.split()
+        return stored
+
     try:
-        credentials = load_credentials()
+        credentials = _load_credentials(fetch, force_check=True)
     except GoogleOAuthError as exc:
-        return {"authenticated": False, "reason": str(exc), **diagnostics}
+        return {
+            "authenticated": False,
+            "reason": str(exc),
+            # True: the check itself failed (database/Google unavailable), so
+            # this is not a reason to sign the user out; retry later.
+            "retryable": isinstance(
+                exc, (GoogleTokenStoreError, GoogleTokenRefreshUnavailableError)
+            ),
+            **diagnostics,
+        }
     entry = _cache
     result: dict[str, Any] = {
         "authenticated": True,
@@ -502,6 +558,7 @@ def auth_status(
 
     Includes safe credential-store diagnostics (database configured and
     reachable, credentials stored, version, last update) — never token values.
+    Costs one database query (plus a token refresh about once an hour).
     """
     return get_auth_status(verify=verify)
 

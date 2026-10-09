@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
-import { Navigate, Route, Routes, useParams } from 'react-router-dom'
-import { api } from './lib/api'
+import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
+import { discardPrefetchedReviews, prefetchAllReviews } from './lib/api'
+import { AUTH_RETRY_DELAYS_MS, checkAuth } from './lib/authCheck'
 import { useBusiness } from './context/BusinessContext'
 import { ReviewsProvider } from './context/ReviewsContext'
 import { AppShell } from './components/AppShell'
+import { StartupScreen } from './components/StartupScreen'
 import { LoginPage } from './pages/LoginPage'
 import { SelectBusinessPage } from './pages/SelectBusinessPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -12,27 +14,47 @@ import { RepliedReviewsPage } from './pages/RepliedReviewsPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { SettingsPage } from './pages/SettingsPage'
 
-export default function App() {
-  const [authed, setAuthed] = useState<boolean | null>(null)
+type AuthState = 'checking' | 'authed' | 'unauthed' | 'unavailable'
+
+// Routes that never show the review list: no review prefetch for them.
+const NO_PREFETCH_PATHS = ['/login', '/select-business']
+
+export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDelaysMs?: number[] }) {
+  const [auth, setAuth] = useState<AuthState>('checking')
+  const [unavailableMessage, setUnavailableMessage] = useState('')
+  const [checkId, setCheckId] = useState(0)
+  const { business } = useBusiness()
+  const { pathname } = useLocation()
 
   useEffect(() => {
     let cancelled = false
-    api
-      .getAuthStatus()
-      .then((status) => {
-        if (!cancelled) setAuthed(status.authenticated)
-      })
-      .catch(() => {
-        if (!cancelled) setAuthed(false)
-      })
+    setAuth('checking')
+    // The review list does not depend on the status answer on the server, so
+    // fetch it in parallel; it is only shown once authentication is confirmed.
+    if (checkId === 0 && business && !NO_PREFETCH_PATHS.includes(pathname)) {
+      prefetchAllReviews(business.location_id)
+    }
+    void checkAuth(retryDelaysMs, () => cancelled).then((result) => {
+      if (cancelled) return
+      if (result.state !== 'authed') discardPrefetchedReviews()
+      if (result.state === 'unavailable') setUnavailableMessage(result.message)
+      setAuth(result.state)
+    })
     return () => {
       cancelled = true
     }
-  }, [])
+    // Runs on mount and on "Try again" only, not on navigation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkId])
 
-  const onAuthExpired = () => setAuthed(false)
+  const authed = auth === 'authed'
+  const setAuthed = (value: boolean) => setAuth(value ? 'authed' : 'unauthed')
+  const onAuthExpired = () => setAuth('unauthed')
 
-  if (authed === null) return <FullPageLoader />
+  if (auth === 'checking') return <StartupScreen />
+  if (auth === 'unavailable') {
+    return <StartupScreen error={unavailableMessage} onRetry={() => setCheckId((id) => id + 1)} />
+  }
 
   return (
     <Routes>
@@ -87,16 +109,5 @@ function ProtectedShell({ authed }: { authed: boolean }) {
     <ReviewsProvider>
       <AppShell />
     </ReviewsProvider>
-  )
-}
-
-function FullPageLoader() {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-[#f6f8fb]">
-      <div className="flex flex-col items-center gap-3">
-        <span className="h-8 w-8 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
-        <p className="text-sm font-medium text-slate-500">Loading…</p>
-      </div>
-    </div>
   )
 }
