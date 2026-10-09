@@ -59,15 +59,23 @@ through the backend, which owns the OAuth token.
 
 ```
 src/
-  lib/          api.ts (centralized service + error normalization), types, utils
-  context/      ToastContext, BusinessContext, ReviewsContext
-  components/    AppShell, Sidebar, TopBar, ReviewCard, StatsCard, RatingStars,
-                 StatusBadge, Avatar, ReplyControls, ReplyEditorModal,
-                 ConfirmDialog, EmptyState, ErrorState, Skeletons
-  pages/         LoginPage, SelectBusinessPage, DashboardPage,
-                 ReviewDetailPage, RepliedReviewsPage, AnalyticsPage,
-                 SettingsPage
-  App.tsx        routing + auth/business guards
+  lib/          api.ts (centralized service + error normalization), types,
+                reviewStats.ts (all metrics/trends, derived from real reviews),
+                replyPreferences.ts, googleAuth.ts, authCheck.ts, utils
+  context/      ToastContext, BusinessContext, ReviewsContext, SessionContext
+  components/   AppShell, Sidebar, TopBar (mobile), PageHeader, BusinessSwitcher,
+                MetricCard, ReviewListItem, ReplyWorkspace (reply composer),
+                BulkReplyPanel, RatingDistribution, TrendChart, Modal,
+                ConfirmDialog, FormControls, StatusBadge, EmptyState,
+                ErrorState, Skeletons
+  pages/        LoginPage, SelectBusinessPage, OverviewPage (/dashboard),
+                ReviewInboxPage (/reviews and /reviews/:reviewId),
+                RepliedReviewsPage, AnalyticsPage, AutomationPage, SettingsPage
+  App.tsx       routing + auth/business guards
 ```
+
+Design tokens (indigo `brand`, `navy` sidebar, `ink`/`canvas`/`line`) live in
+`tailwind.config.js`; shared component classes (`.btn-*`, `.card`, `.input`,
+`.select`) in `src/index.css`.
 
 All network access is funneled through `src/lib/api.ts`.

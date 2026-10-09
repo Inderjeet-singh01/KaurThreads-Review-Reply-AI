@@ -1,38 +1,39 @@
-// Skeleton loaders used while data is fetching.
+// Skeleton loaders that hold the final layout while data is fetching.
 
-export function StatCardSkeleton() {
-  return (
-    <div className="card animate-pulse p-5">
-      <div className="h-3 w-24 rounded bg-slate-200" />
-      <div className="mt-4 h-8 w-16 rounded bg-slate-200" />
-    </div>
-  )
-}
+const bar = 'animate-pulse rounded bg-slate-200'
 
-export function ReviewCardSkeleton() {
+export function ReviewRowSkeleton() {
   return (
-    <div className="animate-pulse border-b border-slate-100 px-5 py-4 last:border-0">
-      <div className="flex items-start gap-3">
-        <div className="h-10 w-10 rounded-full bg-slate-200" />
-        <div className="flex-1 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <div className="h-4 w-32 rounded bg-slate-200" />
-            <div className="h-5 w-20 rounded-full bg-slate-200" />
-          </div>
-          <div className="h-3 w-24 rounded bg-slate-200" />
-          <div className="h-3 w-full rounded bg-slate-200" />
-          <div className="h-3 w-2/3 rounded bg-slate-200" />
+    <div className="flex items-start gap-3 border-b border-line px-4 py-3.5 last:border-0" aria-hidden>
+      <div className="h-9 w-9 shrink-0 animate-pulse rounded-full bg-slate-200" />
+      <div className="flex-1 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className={`${bar} h-3.5 w-28`} />
+          <div className={`${bar} h-3 w-12`} />
         </div>
+        <div className={`${bar} h-3 w-20`} />
+        <div className={`${bar} h-3 w-full`} />
       </div>
     </div>
   )
 }
 
-export function ReviewListSkeleton({ count = 4 }: { count?: number }) {
+export function ReviewListSkeleton({ count = 5 }: { count?: number }) {
   return (
-    <div className="card overflow-hidden">
+    <div role="status" aria-label="Loading reviews">
       {Array.from({ length: count }).map((_, i) => (
-        <ReviewCardSkeleton key={i} />
+        <ReviewRowSkeleton key={i} />
+      ))}
+    </div>
+  )
+}
+
+export function PanelSkeleton({ lines = 4 }: { lines?: number }) {
+  return (
+    <div className="space-y-3 p-5" aria-hidden>
+      <div className={`${bar} h-4 w-40`} />
+      {Array.from({ length: lines }).map((_, i) => (
+        <div key={i} className={`${bar} h-3`} style={{ width: `${90 - i * 12}%` }} />
       ))}
     </div>
   )
@@ -40,14 +41,11 @@ export function ReviewListSkeleton({ count = 4 }: { count?: number }) {
 
 export function BusinessCardSkeleton() {
   return (
-    <div className="card animate-pulse p-4">
-      <div className="flex items-center gap-3">
-        <div className="h-12 w-12 rounded-lg bg-slate-200" />
-        <div className="flex-1 space-y-2">
-          <div className="h-4 w-40 rounded bg-slate-200" />
-          <div className="h-3 w-56 rounded bg-slate-200" />
-          <div className="h-3 w-32 rounded bg-slate-200" />
-        </div>
+    <div className="flex items-center gap-3 rounded-xl border border-line p-4" aria-hidden>
+      <div className="h-11 w-11 animate-pulse rounded-xl bg-slate-200" />
+      <div className="flex-1 space-y-2">
+        <div className={`${bar} h-4 w-40`} />
+        <div className={`${bar} h-3 w-56`} />
       </div>
     </div>
   )

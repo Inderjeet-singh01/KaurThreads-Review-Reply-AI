@@ -1,18 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   AlertTriangle,
-  Bot,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Info,
+  Layers,
   Loader2,
   X,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import type { AutomationStatus, BackfillItem, BackfillJob } from '../lib/types'
 import { classNames } from '../lib/utils'
+import { Modal } from './Modal'
 
 // Bulk "Reply to All Pending Reviews". The backend runs every pending review
 // through the same pipeline as the real-time automation (one at a time); this
@@ -103,6 +104,8 @@ interface BulkReplyPanelProps {
   reviewLabel?: (reviewId: string) => string | undefined
   onAuthExpired: () => void
   pollIntervalMs?: number
+  /** Open the confirmation as soon as a bulk reply can be started (once). */
+  autoOpen?: boolean
 }
 
 export function BulkReplyPanel({
@@ -113,6 +116,7 @@ export function BulkReplyPanel({
   reviewLabel,
   onAuthExpired,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  autoOpen = false,
 }: BulkReplyPanelProps) {
   const [automation, setAutomation] = useState<AutomationStatus | null>(null)
   const [automationError, setAutomationError] = useState(false)
@@ -126,6 +130,7 @@ export function BulkReplyPanel({
   const [cancelling, setCancelling] = useState(false)
   const notifiedJobs = useRef(new Set<string>())
   const reportedPublished = useRef(new Set<string>())
+  const autoOpened = useRef(false)
   const storageKey = jobStorageKey(locationId)
 
   const loadAutomation = useCallback(() => {
@@ -287,8 +292,19 @@ export function BulkReplyPanel({
     setConfirmOpen(true)
   }
 
-  const confirmDialog = confirmOpen && automation && (
+  // "Bulk reply" quick action elsewhere: ask for confirmation right away
+  // (never start without it).
+  useEffect(() => {
+    if (!autoOpen || autoOpened.current || disabled || isActive(job)) return
+    autoOpened.current = true
+    openConfirm()
+    // openConfirm only resets messages and opens the dialog.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpen, disabled, job])
+
+  const confirmDialog = automation && (
     <ConfirmBulkDialog
+      open={confirmOpen}
       pendingCount={pendingCount}
       dryRun={automation.dry_run}
       error={startError}
@@ -326,28 +342,31 @@ export function BulkReplyPanel({
   }
 
   return (
-    <div className="card flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
+    <div className="card flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5">
       <div className="flex items-start gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-brand-50">
-          <Bot className="h-5 w-5 text-brand-600" />
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-50" aria-hidden>
+          <Layers className="h-[18px] w-[18px] text-brand-600" />
         </div>
-        <div>
-          <h2 className="text-sm font-semibold text-slate-900">Bulk reply</h2>
-          <p className="text-sm text-slate-500">
+        <div className="min-w-0">
+          <h2 className="flex flex-wrap items-center gap-2 text-sm font-semibold text-ink">
+            Bulk reply
+            {automation && automation.enabled && <ModeBadge dryRun={automation.dry_run} />}
+          </h2>
+          <p className="text-[13px] text-ink-muted">
             {pendingCount === 0
               ? 'There are no pending reviews right now.'
-              : 'Generate, check and post replies to every pending review automatically.'}
+              : 'Generate, check and post replies to every pending review in one run.'}
           </p>
           {interrupted && (
-            <p className="mt-1 flex items-center gap-1.5 text-sm text-amber-700">
-              <Info className="h-4 w-4" />
+            <p className="mt-1 flex items-start gap-1.5 text-[13px] text-amber-800">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
               The last bulk reply was interrupted (the server restarted). Replies already
               published are safe; start again to continue with the remaining reviews.
             </p>
           )}
-          {notice && <p className="mt-1 text-sm text-slate-600">{notice}</p>}
+          {notice && <p className="mt-1 text-[13px] text-slate-700">{notice}</p>}
           {disabledReason && (
-            <p className="mt-1 text-sm text-rose-600">
+            <p className="mt-1 text-[13px] text-red-700">
               {disabledReason}{' '}
               {automationError && (
                 <button className="font-semibold underline" onClick={loadAutomation}>
@@ -358,11 +377,7 @@ export function BulkReplyPanel({
           )}
         </div>
       </div>
-      <button
-        className="btn-primary shrink-0"
-        disabled={disabled}
-        onClick={openConfirm}
-      >
+      <button className="btn-primary shrink-0" disabled={disabled} onClick={openConfirm}>
         Reply to All Pending Reviews ({pendingCount})
       </button>
 
@@ -372,6 +387,7 @@ export function BulkReplyPanel({
 }
 
 function ConfirmBulkDialog({
+  open,
   pendingCount,
   dryRun,
   error,
@@ -379,6 +395,7 @@ function ConfirmBulkDialog({
   onConfirm,
   onCancel,
 }: {
+  open: boolean
   pendingCount: number
   dryRun: boolean
   error: string | null
@@ -386,66 +403,71 @@ function ConfirmBulkDialog({
   onConfirm: () => void
   onCancel: () => void
 }) {
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !busy) onCancel()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [busy, onCancel])
-
+  const titleId = useId()
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-slate-900/50" onClick={() => !busy && onCancel()} aria-hidden />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="bulk-reply-title"
-        className="relative z-10 w-full max-w-md animate-fade-in rounded-2xl bg-white p-6 shadow-xl"
-      >
-        <h2 id="bulk-reply-title" className="text-lg font-bold text-slate-900">
+    <Modal open={open} onClose={onCancel} labelledBy={titleId} busy={busy} size="md">
+      <div className="overflow-y-auto p-6">
+        <h2 id={titleId} className="text-lg font-semibold text-ink">
           Reply to all pending reviews?
         </h2>
-        <p className="mt-2 text-sm text-slate-600">
+        <p className="mt-2 text-sm leading-relaxed text-slate-600">
           {pendingCount} unanswered {pendingCount === 1 ? 'review' : 'reviews'} will be processed
           automatically. Each reply will be generated, validated, and checked before publishing.
         </p>
+        <ol className="mt-4 space-y-2 rounded-lg border border-line bg-slate-50 p-4 text-[13px] text-slate-700">
+          {[
+            'AI drafts a reply for each review, one at a time on the server.',
+            'Each draft is checked; a draft that fails is regenerated or skipped.',
+            'Google is checked again right before publishing — reviews answered meanwhile are skipped.',
+          ].map((step, i) => (
+            <li key={step} className="flex gap-2.5">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-white text-[11px] font-semibold text-brand-700 ring-1 ring-brand-100">
+                {i + 1}
+              </span>
+              {step}
+            </li>
+          ))}
+        </ol>
         {dryRun ? (
-          <p className="mt-3 flex gap-2 rounded-lg bg-sky-50 p-3 text-sm text-sky-800">
-            <Info className="mt-0.5 h-4 w-4 shrink-0" />
+          <p className="mt-4 flex gap-2 rounded-lg bg-sky-50 p-3 text-sm text-sky-900">
+            <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
             Dry run is enabled. Replies will be generated but not published.
           </p>
         ) : (
-          <p className="mt-3 flex gap-2 rounded-lg bg-rose-50 p-3 text-sm font-semibold text-rose-800">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <p className="mt-4 flex gap-2 rounded-lg bg-amber-50 p-3 text-sm font-semibold text-amber-900">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
             Replies will be published to Google.
           </p>
         )}
+        <p className="mt-3 text-[13px] text-ink-muted">
+          You can stop the run after the current review. This one-time job is separate from
+          automatic replies to new reviews.
+        </p>
         {error && (
-          <p role="alert" className="mt-3 text-sm text-rose-600">
+          <p role="alert" className="mt-3 text-sm text-red-700">
             {error}
           </p>
         )}
-        <div className="mt-6 flex justify-end gap-3">
-          <button className="btn-secondary" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
-          <button className="btn-primary" onClick={onConfirm} disabled={busy}>
-            {busy ? 'Starting…' : 'Start Bulk Reply'}
-          </button>
-        </div>
       </div>
-    </div>
+      <div className="flex flex-col-reverse gap-2 border-t border-line bg-slate-50 px-6 py-4 sm:flex-row sm:justify-end sm:gap-3">
+        <button className="btn-secondary" onClick={onCancel} disabled={busy} data-autofocus>
+          Cancel
+        </button>
+        <button className="btn-primary" onClick={onConfirm} disabled={busy}>
+          {busy ? 'Starting…' : 'Start Bulk Reply'}
+        </button>
+      </div>
+    </Modal>
   )
 }
 
 function Counts({ job }: { job: BackfillJob }) {
   const counts: Array<[string, number, string]> = [
     job.dry_run
-      ? ['Would publish', job.would_publish, 'text-sky-700']
-      : ['Published', job.published, 'text-emerald-700'],
+      ? ['Would publish', job.would_publish, 'text-sky-800']
+      : ['Published', job.published, 'text-green-700'],
     ['Skipped', job.skipped, 'text-slate-700'],
-    ['Failed', job.failed, job.failed ? 'text-rose-700' : 'text-slate-700'],
+    ['Failed', job.failed, job.failed ? 'text-red-700' : 'text-slate-700'],
   ]
   return (
     <dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm">
@@ -463,11 +485,11 @@ function ModeBadge({ dryRun }: { dryRun: boolean }) {
   return (
     <span
       className={classNames(
-        'rounded-full px-2 py-0.5 text-xs font-semibold',
-        dryRun ? 'bg-sky-100 text-sky-700' : 'bg-rose-100 text-rose-700',
+        'rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ring-inset',
+        dryRun ? 'bg-sky-50 text-sky-800 ring-sky-100' : 'bg-amber-50 text-amber-800 ring-amber-100',
       )}
     >
-      {dryRun ? 'Dry run' : 'Live'}
+      {dryRun ? 'Dry run' : 'Live publishing'}
     </span>
   )
 }
@@ -510,8 +532,15 @@ function ProgressCard({
       <p className="mt-3 text-sm font-medium text-slate-700">
         {job.processed} / {job.total} processed
       </p>
-      <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100">
-        <div className="h-full rounded-full bg-brand-600 transition-all" style={{ width: `${percent}%` }} />
+      <div
+        className="mt-2 h-2 overflow-hidden rounded-full bg-brand-50"
+        role="progressbar"
+        aria-label="Bulk reply progress"
+        aria-valuemin={0}
+        aria-valuemax={job.total}
+        aria-valuenow={job.processed}
+      >
+        <div className="h-full rounded-full bg-brand-600 transition-[width] duration-300" style={{ width: `${percent}%` }} />
       </div>
       <Counts job={job} />
       <p className="mt-2 text-sm text-slate-500">
@@ -523,7 +552,7 @@ function ProgressCard({
             : 'Waiting before the next review…'}
       </p>
       {connectionLost && (
-        <p role="alert" className="mt-2 text-sm text-rose-600">
+        <p role="alert" className="mt-2 text-sm text-red-700">
           Lost connection to the server. The bulk reply keeps running there.{' '}
           <button className="font-semibold underline" onClick={onRetry}>
             Check again
@@ -564,7 +593,7 @@ function ResultCard({
           <Icon
             className={classNames(
               'h-5 w-5',
-              job.status === 'COMPLETED' ? 'text-emerald-600' : 'text-amber-600',
+              job.status === 'COMPLETED' ? 'text-green-600' : 'text-amber-600',
             )}
           />
           {title}
@@ -588,7 +617,7 @@ function ResultCard({
       <Counts job={job} />
       <ItemList
         label="failed"
-        tone="text-rose-700"
+        tone="text-red-700"
         items={failed}
         reason={failureReason}
         reviewLabel={reviewLabel}
@@ -601,7 +630,7 @@ function ResultCard({
         reviewLabel={reviewLabel}
       />
       {onRunAgain && pendingCount > 0 && (
-        <div className="mt-4 flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mt-4 flex flex-col gap-2 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm text-slate-600">
             {pendingCount} {pendingCount === 1 ? 'review is' : 'reviews are'} still unanswered.
           </p>

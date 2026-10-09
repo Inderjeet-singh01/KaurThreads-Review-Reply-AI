@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { MessagesSquare, RefreshCw, WifiOff } from 'lucide-react'
+import { RefreshCw, WifiOff } from 'lucide-react'
+import { BrandMark } from './BrandMark'
 
 /** After this long, explain that a sleeping free-plan backend is waking up. */
 export const SLOW_START_HINT_MS = 4000
@@ -25,19 +26,17 @@ export function StartupScreen({ error, onRetry }: StartupScreenProps) {
   }, [error])
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#f6f8fb] px-4">
+    <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
       <div className="w-full max-w-sm text-center">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-navy-900 shadow-card">
-          <MessagesSquare className="h-7 w-7 text-brand-500" />
-        </div>
-        <p className="mt-4 text-lg font-bold text-slate-900">Review Reply AI</p>
+        <BrandMark className="mx-auto h-14 w-14 rounded-2xl shadow-card" />
+        <p className="mt-4 text-lg font-bold text-ink">Review Reply AI</p>
 
         {error ? (
           <div role="alert" className="mt-6">
             <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-amber-100">
               <WifiOff className="h-5 w-5 text-amber-600" />
             </div>
-            <p className="mt-3 text-sm font-semibold text-slate-800">
+            <p className="mt-3 text-sm font-semibold text-ink">
               We couldn’t check your connection
             </p>
             <p className="mt-1 text-sm text-slate-500">{error}</p>

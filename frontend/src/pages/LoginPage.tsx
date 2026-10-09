@@ -1,27 +1,25 @@
 import { useState } from 'react'
-import { MessagesSquare, ShieldCheck, Sparkles, ThumbsUp, Timer } from 'lucide-react'
+import { Lock, ShieldCheck, Timer, TrendingUp } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { goToGoogleSignIn } from '../lib/googleAuth'
 import { useToast } from '../context/ToastContext'
+import { BrandMark } from '../components/BrandMark'
 
-const FEATURES = [
+const BENEFITS = [
   {
     icon: Timer,
-    title: 'Save Time',
-    description: 'AI-powered reply suggestions',
-    color: 'bg-violet-50 text-violet-500',
+    title: 'Reply in seconds',
+    description: 'AI drafts a thoughtful reply for every review.',
   },
   {
-    icon: ThumbsUp,
-    title: 'Professional',
-    description: 'Polite & brand aligned replies',
-    color: 'bg-emerald-50 text-emerald-500',
+    icon: ShieldCheck,
+    title: 'You stay in control',
+    description: 'Edit and check each reply, then publish it when you are happy.',
   },
   {
-    icon: Sparkles,
-    title: 'Better Reputation',
-    description: 'Respond to reviews faster',
-    color: 'bg-rose-50 text-rose-500',
+    icon: TrendingUp,
+    title: 'Grow your reputation',
+    description: 'Answer every customer and track ratings over time.',
   },
 ]
 
@@ -49,77 +47,101 @@ export function LoginPage({ error }: { error?: string | null }) {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#f6f8fb] px-4 py-10">
-      <div className="w-full max-w-md">
-        <div className="card p-8 sm:p-10">
-          {/* Google G mark */}
-          <div className="flex justify-center">
-            <GoogleG className="h-11 w-11" />
-          </div>
-
-          <h1 className="mt-5 text-center text-2xl font-bold text-slate-900">
-            Manage Your Google Reviews with AI
-          </h1>
-          <p className="mt-2.5 text-center text-sm leading-relaxed text-slate-500">
-            Connect your Google Business Profile to view and reply to customer reviews
-            using AI.
+    <div className="flex min-h-screen bg-canvas">
+      {/* Brand panel (large screens) */}
+      <aside className="relative hidden w-[44%] max-w-xl flex-col justify-between overflow-hidden bg-navy-900 p-12 text-white lg:flex">
+        <div
+          className="pointer-events-none absolute -right-32 -top-32 h-96 w-96 rounded-full bg-brand-600/20 blur-3xl"
+          aria-hidden
+        />
+        <div className="relative flex items-center gap-2.5">
+          <BrandMark className="h-9 w-9" />
+          <span className="text-lg font-semibold">Review Reply AI</span>
+        </div>
+        <div className="relative">
+          <p className="text-3xl font-bold leading-tight tracking-tight">
+            Every Google review answered — thoughtfully and on time.
           </p>
-
-          <div className="mt-8 grid grid-cols-3 gap-3">
-            {FEATURES.map(({ icon: Icon, title, description, color }) => (
-              <div key={title} className="text-center">
-                <div
-                  className={`mx-auto flex h-11 w-11 items-center justify-center rounded-full ${color}`}
-                >
+          <ul className="mt-10 space-y-6">
+            {BENEFITS.map(({ icon: Icon, title, description }) => (
+              <li key={title} className="flex gap-4">
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white/10 text-brand-300" aria-hidden>
                   <Icon className="h-5 w-5" />
-                </div>
-                <p className="mt-2 text-xs font-semibold text-slate-800">{title}</p>
-                <p className="mt-0.5 text-[11px] leading-tight text-slate-400">
-                  {description}
-                </p>
-              </div>
+                </span>
+                <span>
+                  <span className="block font-semibold">{title}</span>
+                  <span className="block text-sm text-slate-400">{description}</span>
+                </span>
+              </li>
             ))}
-          </div>
+          </ul>
+        </div>
+        <p className="relative text-xs text-slate-500">Works with Google Business Profile</p>
+      </aside>
 
-          {error && (
-            <p
-              role="alert"
-              className="mt-8 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
-            >
-              {error}
+      {/* Sign-in */}
+      <main className="flex flex-1 items-center justify-center px-4 py-10 sm:px-8">
+        <div className="w-full max-w-md">
+          <div className="card p-7 sm:p-10">
+            <BrandMark className="mx-auto h-12 w-12 lg:hidden" />
+            <p className="mt-4 text-center text-sm font-semibold text-brand-700 lg:mt-0">
+              Review Reply AI
             </p>
-          )}
+            <h1 className="mt-2 text-center text-2xl font-bold tracking-tight text-ink">
+              Manage Your Google Reviews with AI
+            </h1>
+            <p className="mt-2.5 text-center text-sm leading-relaxed text-ink-muted">
+              Connect your Google Business Profile to read your reviews, draft replies with AI and
+              publish them to Google.
+            </p>
 
-          <button
-            onClick={handleSignIn}
-            disabled={connecting}
-            className={`btn-primary w-full py-3 text-[15px] ${error ? 'mt-4' : 'mt-8'}`}
-          >
-            {connecting ? (
-              <>
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-                Redirecting to Google…
-              </>
-            ) : (
-              <>
-                <GoogleG className="h-5 w-5 rounded-full bg-white p-0.5" />
-                Sign in with Google
-              </>
+            {error && (
+              <p
+                role="alert"
+                className="mt-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+              >
+                {error}
+              </p>
             )}
-          </button>
 
-          <p className="mt-6 flex items-center justify-center gap-1.5 text-center text-xs text-slate-400">
-            <ShieldCheck className="h-3.5 w-3.5" />
-            Your data is secure. We only access your Google Business Profile to manage
-            reviews.
-          </p>
-        </div>
+            <button
+              onClick={handleSignIn}
+              disabled={connecting}
+              className="focus-ring mt-6 flex w-full items-center justify-center gap-3 rounded-[10px] border border-line bg-white px-4 py-3 text-[15px] font-semibold text-ink shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-wait disabled:opacity-70"
+            >
+              {connecting ? (
+                <>
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" aria-hidden />
+                  Redirecting to Google…
+                </>
+              ) : (
+                <>
+                  <GoogleG className="h-5 w-5" />
+                  Sign in with Google
+                </>
+              )}
+            </button>
 
-        <div className="mt-6 flex items-center justify-center gap-2 text-sm text-slate-400">
-          <MessagesSquare className="h-4 w-4" />
-          Review Reply AI
+            <ul className="mt-8 space-y-3 lg:hidden">
+              {BENEFITS.map(({ icon: Icon, title, description }) => (
+                <li key={title} className="flex gap-3 text-sm">
+                  <Icon className="mt-0.5 h-4 w-4 shrink-0 text-brand-600" aria-hidden />
+                  <span>
+                    <span className="font-semibold text-ink">{title}.</span>{' '}
+                    <span className="text-ink-muted">{description}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+
+            <p className="mt-8 flex items-start justify-center gap-2 text-center text-xs leading-relaxed text-ink-muted">
+              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+              Secure Google sign-in. Access is limited to managing your Business Profile; your
+              Google credentials stay encrypted on our server.
+            </p>
+          </div>
         </div>
-      </div>
+      </main>
     </div>
   )
 }

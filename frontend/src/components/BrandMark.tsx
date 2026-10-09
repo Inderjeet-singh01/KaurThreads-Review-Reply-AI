@@ -1,0 +1,18 @@
+import { classNames } from '../lib/utils'
+
+/** Product mark (same artwork as public/favicon.svg). */
+export function BrandMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 32 32" className={classNames('shrink-0', className)} aria-hidden>
+      <rect width="32" height="32" rx="8" fill="#4f46e5" />
+      <path
+        d="M9 8h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-8l-5 4v-4H9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z"
+        fill="#fff"
+      />
+      <path
+        d="M16 10.1l1.12 2.86 3.06.18-2.37 1.95.78 2.97L16 16.4l-2.59 1.66.78-2.97-2.37-1.95 3.06-.18z"
+        fill="#4f46e5"
+      />
+    </svg>
+  )
+}

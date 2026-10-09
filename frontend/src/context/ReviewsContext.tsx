@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from 'react'
 import { ApiError, api, takePrefetchedReviews } from '../lib/api'
+import { summarizeReviews } from '../lib/reviewStats'
 import type { Review, ReviewStats } from '../lib/types'
 import { useBusiness } from './BusinessContext'
 
@@ -43,17 +44,6 @@ const ReviewsContext = createContext<ReviewsContextValue | null>(null)
 interface LocalReply {
   reply_comment: string | null
   reply_updated_at: string
-}
-
-function computeStats(reviews: Review[]): ReviewStats {
-  const total = reviews.length
-  const answered = reviews.filter((r) => r.has_reply).length
-  const rated = reviews.filter((r) => r.rating != null) as Array<Review & { rating: number }>
-  const average =
-    rated.length > 0
-      ? Math.round((rated.reduce((sum, r) => sum + r.rating, 0) / rated.length) * 10) / 10
-      : null
-  return { total_reviews: total, answered, unanswered: total - answered, average_rating: average }
 }
 
 export function ReviewsProvider({ children }: { children: ReactNode }) {
@@ -147,7 +137,7 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
 
   const unanswered = useMemo(() => reviews.filter((r) => !r.has_reply), [reviews])
   const replied = useMemo(() => reviews.filter((r) => r.has_reply), [reviews])
-  const stats = useMemo(() => computeStats(reviews), [reviews])
+  const stats = useMemo(() => summarizeReviews(reviews), [reviews])
   const getReview = useCallback(
     (id: string) => reviews.find((r) => r.review_id === id),
     [reviews],

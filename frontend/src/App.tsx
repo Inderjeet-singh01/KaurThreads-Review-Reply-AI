@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { discardPrefetchedReviews, prefetchAllReviews } from './lib/api'
 import { AUTH_RETRY_DELAYS_MS, checkAuth } from './lib/authCheck'
 import {
@@ -11,12 +11,14 @@ import {
 import { useBusiness } from './context/BusinessContext'
 import { useToast } from './context/ToastContext'
 import { ReviewsProvider } from './context/ReviewsContext'
+import { SessionContext } from './context/SessionContext'
 import { AppShell } from './components/AppShell'
 import { StartupScreen } from './components/StartupScreen'
 import { LoginPage } from './pages/LoginPage'
 import { SelectBusinessPage } from './pages/SelectBusinessPage'
-import { DashboardPage } from './pages/DashboardPage'
-import { ReviewDetailPage } from './pages/ReviewDetailPage'
+import { OverviewPage } from './pages/OverviewPage'
+import { ReviewInboxPage } from './pages/ReviewInboxPage'
+import { AutomationPage } from './pages/AutomationPage'
 import { RepliedReviewsPage } from './pages/RepliedReviewsPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { SettingsPage } from './pages/SettingsPage'
@@ -82,7 +84,7 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
   }, [checkId])
 
   const authed = auth === 'authed'
-  const onAuthExpired = () => setAuth('unauthed')
+  const onAuthExpired = useCallback(() => setAuth('unauthed'), [])
 
   if (auth === 'checking') return <StartupScreen />
   if (auth === 'unavailable') {
@@ -112,14 +114,13 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
         }
       />
 
-      <Route element={<ProtectedShell authed={authed} />}>
-        {/* Distinct keys: both routes render DashboardPage, and without them
-            React would reuse one instance and keep the previous tab. */}
-        <Route path="/dashboard" element={<DashboardPage key="dashboard" defaultTab="unanswered" onAuthExpired={onAuthExpired} />} />
-        <Route path="/reviews" element={<DashboardPage key="reviews" defaultTab="all" onAuthExpired={onAuthExpired} />} />
-        <Route path="/reviews/:reviewId" element={<ReviewDetailRoute onAuthExpired={onAuthExpired} />} />
+      <Route element={<ProtectedShell authed={authed} onAuthExpired={onAuthExpired} />}>
+        <Route path="/dashboard" element={<OverviewPage onAuthExpired={onAuthExpired} />} />
+        {/* /reviews/:reviewId keeps direct links to a review working. */}
+        <Route path="/reviews/:reviewId?" element={<ReviewInboxPage onAuthExpired={onAuthExpired} />} />
         <Route path="/replied" element={<RepliedReviewsPage onAuthExpired={onAuthExpired} />} />
         <Route path="/analytics" element={<AnalyticsPage onAuthExpired={onAuthExpired} />} />
+        <Route path="/automation" element={<AutomationPage onAuthExpired={onAuthExpired} />} />
         <Route path="/settings" element={<SettingsPage onAuthExpired={onAuthExpired} />} />
       </Route>
 
@@ -128,19 +129,15 @@ export default function App({ retryDelaysMs = AUTH_RETRY_DELAYS_MS }: { retryDel
   )
 }
 
-/** Fresh detail state (draft, validation, auto-generation) per review id. */
-function ReviewDetailRoute({ onAuthExpired }: { onAuthExpired: () => void }) {
-  const { reviewId = '' } = useParams()
-  return <ReviewDetailPage key={reviewId} onAuthExpired={onAuthExpired} />
-}
-
-function ProtectedShell({ authed }: { authed: boolean }) {
+function ProtectedShell({ authed, onAuthExpired }: { authed: boolean; onAuthExpired: () => void }) {
   const { business } = useBusiness()
   if (!authed) return <Navigate to="/login" replace />
   if (!business) return <Navigate to="/select-business" replace />
   return (
-    <ReviewsProvider>
-      <AppShell />
-    </ReviewsProvider>
+    <SessionContext.Provider value={{ onAuthExpired }}>
+      <ReviewsProvider>
+        <AppShell />
+      </ReviewsProvider>
+    </SessionContext.Provider>
   )
 }

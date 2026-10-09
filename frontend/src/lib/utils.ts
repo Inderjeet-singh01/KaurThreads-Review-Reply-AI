@@ -66,6 +66,14 @@ export function formatTimeWithRelative(iso: string | null): string {
     : exact
 }
 
+/** A duration in minutes as words: 10080 -> "7 days", 0 -> "No limit". */
+export function formatMinutes(minutes: number): string {
+  if (minutes <= 0) return 'No limit'
+  if (minutes % 1440 === 0) return `${minutes / 1440} ${minutes === 1440 ? 'day' : 'days'}`
+  if (minutes % 60 === 0) return `${minutes / 60} ${minutes === 60 ? 'hour' : 'hours'}`
+  return `${minutes} minutes`
+}
+
 /** Milliseconds since epoch for sorting; missing/invalid dates sort as 0. */
 export function timestamp(iso: string | null): number {
   if (!iso) return 0

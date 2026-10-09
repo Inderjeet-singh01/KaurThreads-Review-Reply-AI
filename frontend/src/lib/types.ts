@@ -77,6 +77,36 @@ export interface AutomationStatus {
   webhook_auth_configured: boolean
   test_endpoint_enabled: boolean
   backfill_delay_seconds: number
+  // Reported by newer backends (absent on older ones).
+  verify_after_publish?: boolean
+  reconciliation_enabled?: boolean
+  reconciliation_auth_configured?: boolean
+  reconciliation_max_reviews?: number
+  reconciliation_lookback_minutes?: number
+  /** Latest run of the scheduled safety net since the server started. */
+  last_reconciliation?: ReconciliationSummary | null
+}
+
+/** Summary of one reconciliation run (no reply text or credentials). */
+export interface ReconciliationSummary {
+  job_id: string
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED'
+  trigger: string
+  location_id: string | null
+  dry_run: boolean
+  lookback_minutes: number
+  max_reviews: number
+  unanswered_recent: number
+  total: number
+  processed: number
+  published: number
+  would_publish: number
+  skipped: number
+  failed: number
+  deferred: number
+  started_at: string
+  finished_at: string | null
+  error: string | null
 }
 
 /** Bulk "reply to all pending reviews" (POST /automation/backfill). */
