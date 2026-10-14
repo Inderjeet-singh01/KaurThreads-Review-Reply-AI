@@ -15,6 +15,7 @@ import asyncio
 import base64
 import datetime
 import json
+import re
 import threading
 import unittest
 from unittest import mock
@@ -738,6 +739,110 @@ class ReconciliationTests(ResilienceTestCase):
 
 
 # --- 22: expired access token, database-backed credentials ------------------------------
+class ProductionRegressionTests(ResilienceTestCase):
+    """The production failure modes, with the production configuration.
+
+    History: before 6f32d17 the webhook answered 400 to a real NEW_REVIEW
+    (payload keys ['location', 'review', 'type']) because its review value
+    did not match one strict ``accounts/…/locations/…/reviews/…`` regex.
+    Ids below are synthetic; nothing touches the real Business Profile.
+    """
+
+    _OLD_STRICT_REVIEW_RE = re.compile(r"^accounts/[^/]+/locations/[^/]+/reviews/[^/]+$")
+    REVIEW = "AbFvOqTEST-x_9Zk--Q_1"  # same alphabet as real Google review ids
+
+    def setUp(self):
+        super().setUp()
+        self._patch_settings(google_location_id=PROD_LOCATION_ID)
+
+    def reconcile(self) -> dict:
+        response = self.client.post(
+            "/automation/reconcile", params={"wait": "true"},
+            headers={"X-Reconcile-Secret": SECRET},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_review_values_the_old_parser_rejected_are_processed(self):
+        shapes = {
+            "short": f"locations/{PROD_LOCATION_ID}/reviews/{self.REVIEW}-a",
+            "bare": f"{self.REVIEW}-b",
+            "object": {"name": f"{PROD_LOCATION}/reviews/{self.REVIEW}-c"},
+            "api_url": f"https://mybusiness.googleapis.com/v4/{PROD_LOCATION}/reviews/{self.REVIEW}-d",
+        }
+        for index, (shape, review) in enumerate(shapes.items()):
+            with self.subTest(shape=shape):
+                review_id = f"{self.REVIEW}-{'abcd'[index]}"
+                self.add_review(review_id)
+                if isinstance(review, str):
+                    self.assertIsNone(self._OLD_STRICT_REVIEW_RE.match(review))
+                data = {"type": "NEW_REVIEW", "review": review, "location": PROD_LOCATION}
+                response = self.post(data, message_id=f"hist-{shape}")
+                self.assertEqual(response.status_code, 200, response.text)
+                body = response.json()
+                self.assertEqual((body["status"], body["review_id"], body["resolution"]),
+                                 ("PUBLISHED", review_id, "exact"))
+        self.list_reviews.assert_not_called()
+
+    def test_documented_payload_is_processed(self):
+        # Notifications API reference: NEW_REVIEW carries review_name (the
+        # review's resource name) and location_name (the location's).
+        self.add_review(self.REVIEW)
+        response = self.post({
+            "type": "NEW_REVIEW",
+            "review_name": f"{PROD_LOCATION}/reviews/{self.REVIEW}",
+            "location_name": PROD_LOCATION,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "PUBLISHED")
+        self.assertEqual(self.published_ids(), [self.REVIEW])
+
+    def test_test_event_never_triggers_a_reply(self):
+        self.add_review(self.REVIEW)  # a real unanswered review exists
+        for message_id, data in (
+            ("t1", {"type": "TEST_EVENT"}),
+            ("t2", {"type": "TEST_EVENT", "location": PROD_LOCATION,
+                    "review": f"{PROD_LOCATION}/reviews/{self.REVIEW}"}),
+        ):
+            with self.subTest(data=data):
+                response = self.post(data, message_id=message_id)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "IGNORED")
+        self.get_review.assert_not_called()
+        self.list_reviews.assert_not_called()
+        self.groq.assert_not_called()
+        self.publish.assert_not_called()
+
+    def test_review_not_yet_readable_is_recovered_by_reconciliation(self):
+        data = _new_review(f"{PROD_LOCATION}/reviews/{self.REVIEW}", location=PROD_LOCATION)
+        # The notification can arrive before the Reviews API returns the review.
+        response = self.post(data, message_id="early")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "SKIPPED_NOT_FOUND")
+        self.publish.assert_not_called()
+
+        # Once Google serves it, the scheduled reconciliation answers it once.
+        self.add_review(self.REVIEW)
+        body = self.reconcile()
+        self.assertEqual(body["published"], 1)
+        self.assertEqual(self.published_ids(), [self.REVIEW])
+
+        # A late redelivery of the same notification cannot reply again.
+        response = self.post(data, message_id="early")
+        self.assertEqual(response.json()["status"], "SKIPPED_ALREADY_REPLIED")
+        self.assertEqual(self.published_ids(), [self.REVIEW])
+
+    def test_review_without_any_notification_is_answered_only_by_reconciliation(self):
+        # The production incident: the review exists, Pub/Sub never delivered.
+        self.add_review(self.REVIEW, minutes_ago=12)
+        self.add_review("older-answered", minutes_ago=60, replied=True)
+        self.publish.assert_not_called()
+        body = self.reconcile()
+        self.assertEqual((body["total"], body["published"]), (1, 1))
+        self.assertEqual(self.published_ids(), [self.REVIEW])
+        self.assertEqual(self.reconcile()["total"], 0)  # nothing left: no duplicate reply
+
+
 class ExpiredTokenTests(DatabaseTestCase):
     def setUp(self):
         super().setUp()
